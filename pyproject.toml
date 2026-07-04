@@ -12,6 +12,7 @@ dependencies = [
     "psutil>=5.9",
     "mss>=9.0",
     "pillow>=10.0",
+    "claude-agent-sdk>=0.2.110",
 ]
 
 [project.optional-dependencies]

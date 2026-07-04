@@ -40,6 +40,47 @@ class PolicyConfig(BaseModel):
     # Ships false; the Slack/console gateways are the real path.
     auto_approve_dangerous: bool = False
 
+    # --- consequence-gating (Agent SDK permission model) ---------------------
+    # Path prefixes / URL domains the agent may READ without asking.
+    # Empty => reads are unrestricted (permissive demo default; a fund fills this).
+    read_allowlist: list[str] = Field(default_factory=list)
+    # Words that mark a write as outward-facing / irreversible → always confirm.
+    outward_keywords: list[str] = Field(
+        default_factory=lambda: [
+            "send", "submit", "pay", "purchase", "confirm", "delete",
+            "transfer", "wire", "publish", "checkout",
+        ]
+    )
+    # Shell commands matching these regexes are treated as read-only.
+    bash_read_patterns: list[str] = Field(
+        default_factory=lambda: [
+            r"^\s*ls(\s|$)", r"^\s*cat\s", r"^\s*head\s", r"^\s*tail\s",
+            r"^\s*grep\s", r"^\s*rg\s", r"^\s*find\s", r"^\s*pwd(\s|$)",
+            r"^\s*echo\s", r"^\s*which\s", r"^\s*git\s+(status|diff|log|show|branch)\b",
+            r"^\s*ps(\s|$)", r"^\s*df(\s|$)", r"^\s*du\s", r"^\s*wc\s",
+            r"^\s*stat\s", r"^\s*file\s", r"^\s*whoami\b", r"^\s*date\b",
+        ]
+    )
+    # Shell commands matching these regexes are outward-facing / irreversible.
+    bash_outward_patterns: list[str] = Field(
+        default_factory=lambda: [
+            r"\bgit\s+push\b", r"\bcurl\b.*-X\s*(POST|PUT|DELETE|PATCH)",
+            r"\bcurl\b.*\s-d\b", r"\bwget\b", r"\brm\s+-", r"\bssh\b",
+            r"\bscp\b", r"\bmail\b", r"\bsendmail\b", r"\bgh\s+pr\s+create\b",
+            r"\bnpm\s+publish\b",
+        ]
+    )
+
+    def matches_any(self, patterns: list[str], text: str) -> bool:
+        return any(re.search(p, text) for p in patterns)
+
+    def read_allowed(self, target: str) -> bool:
+        """True if a read target (path or URL) is inside the read allowlist."""
+        if not self.read_allowlist:
+            return True
+        t = str(target)
+        return any(entry in t for entry in self.read_allowlist)
+
     def effective_risk(self, tool_name: str, base: Risk) -> Risk:
         override = self.risk_overrides.get(tool_name)
         return Risk.parse(override) if override is not None else base

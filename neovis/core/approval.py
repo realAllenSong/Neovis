@@ -18,6 +18,7 @@ class ApprovalRequest:
     risk: str
     session_id: str | None = None
     summary: str | None = None  # short human-readable "about to run X"
+    severe: bool = False        # outward/irreversible → request double-confirmation
 
 
 @dataclass
@@ -25,6 +26,10 @@ class ApprovalDecision:
     approved: bool
     approver: str | None = None
     reason: str | None = None
+    # "once" = approve just this action; "auto" = approve and auto-run the rest
+    # of this series (enters auto-mode until the task ends). Only honoured for
+    # LOCAL_WRITE actions — outward actions always re-ask.
+    scope: str = "once"
 
 
 class ApprovalGateway(ABC):
@@ -37,11 +42,12 @@ class ApprovalGateway(ABC):
 class AutoApprove(ApprovalGateway):
     """Non-interactive: approve everything. For tests and (opt-in) demos only."""
 
-    def __init__(self, approver: str = "auto"):
+    def __init__(self, approver: str = "auto", scope: str = "once"):
         self._approver = approver
+        self._scope = scope
 
     async def request(self, req: ApprovalRequest) -> ApprovalDecision:
-        return ApprovalDecision(approved=True, approver=self._approver)
+        return ApprovalDecision(approved=True, approver=self._approver, scope=self._scope)
 
 
 class DenyAll(ApprovalGateway):
@@ -57,16 +63,32 @@ class ConsoleApproval(ApprovalGateway):
     async def request(self, req: ApprovalRequest) -> ApprovalDecision:
         import asyncio
 
+        tier = "OUTWARD/irreversible" if req.severe else req.risk
         prompt = (
-            f"\n⚠️  Approve DANGEROUS action?\n"
+            f"\n⚠️  Approve {tier} action?\n"
             f"    tool: {req.tool}\n"
             f"    args: {req.args}\n"
-            f"    [y/N] > "
+            f"    [y]es / [a]uto-run rest / [N]o > "
         )
-        answer = await asyncio.to_thread(input, prompt)
-        ok = answer.strip().lower() in ("y", "yes")
+        answer = (await asyncio.to_thread(input, prompt)).strip().lower()
+        if answer in ("a", "auto"):
+            approved, scope = True, "auto"
+        elif answer in ("y", "yes"):
+            approved, scope = True, "once"
+        else:
+            approved, scope = False, "once"
+
+        # Outward/irreversible actions require a second confirmation.
+        if approved and req.severe:
+            confirm = (await asyncio.to_thread(
+                input, "    This is irreversible. Type 'send' to confirm > "
+            )).strip().lower()
+            if confirm != "send":
+                return ApprovalDecision(approved=False, reason="double-confirm failed")
+
         return ApprovalDecision(
-            approved=ok,
-            approver="console" if ok else None,
-            reason=None if ok else "rejected at console",
+            approved=approved,
+            approver="console" if approved else None,
+            reason=None if approved else "rejected at console",
+            scope=scope,
         )
