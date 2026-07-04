@@ -1,0 +1,25 @@
+# Local dev gateway: exposes the Anthropic Messages API (what the Claude Agent
+# SDK / Claude Code speaks) and translates to any OpenAI-compatible backend.
+# This is the "gateway for non-Claude models" path — the same shape you'd use to
+# put a company GPT/GLM proxy behind Neovis.
+#
+# Run:  NVIDIA_API_KEY=... uv run litellm --config dev/litellm.config.yaml --port 4000
+# Then: ANTHROPIC_BASE_URL=http://localhost:4000  ANTHROPIC_API_KEY=sk-neovis-local
+#
+# The API key is read from the environment — never hardcode it here.
+
+model_list:
+  - model_name: glm-5.2
+    litellm_params:
+      model: nvidia_nim/z-ai/glm-5.2      # LiteLLM's native NVIDIA NIM provider
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: os.environ/NVIDIA_API_KEY
+
+litellm_settings:
+  drop_params: true          # tolerate params GLM doesn't accept
+
+general_settings:
+  # Static key auth, no database. The client must send exactly this key; Neovis
+  # forces the bundled engine into api-key mode (clearing any OAuth token) so it
+  # presents this and not the user's logged-in Claude credential.
+  master_key: sk-neovis-local
