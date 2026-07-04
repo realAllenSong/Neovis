@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Neovis runtime
+*.db
+neovis_audit.db
+neovis_screen_*.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# uv
+.uv/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

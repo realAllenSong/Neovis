@@ -1,0 +1,31 @@
+# Neovis security policy — the guardrails around a live work computer.
+#
+# Three tiers, enforced centrally by the tool registry:
+#   safe      -> runs immediately (read-only: screenshots, listing, reading)
+#   moderate  -> runs and is audited (writes a file, opens an app)
+#   dangerous -> requires human approval before running (shell, delete, GUI)
+#
+# Regardless of tier, denylist matches below are ALWAYS refused and cannot be
+# approved. Writes/zips are confined to sandbox_roots.
+
+# Shell commands matching any of these (Python regex) are hard-blocked.
+shell_denylist:
+  - 'rm\s+-rf\s+/'
+  - ':\(\)\s*\{'          # fork bomb
+  - 'mkfs'
+  - 'dd\s+if='
+  - '\bshutdown\b'
+  - '\breboot\b'
+  - '>\s*/dev/sd'
+
+# Absolute path prefixes that write_file / make_zip are confined to.
+# Empty list => the user's home directory only.
+sandbox_roots: []
+
+# Per-tool risk overrides, e.g. tighten run_shell or relax a trusted tool.
+# risk_overrides:
+#   run_shell: dangerous
+
+# Demo/dev escape hatch: auto-approve dangerous actions instead of prompting.
+# Leave false in production — the Slack/console gateways are the real path.
+auto_approve_dangerous: false

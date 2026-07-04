@@ -1,0 +1,24 @@
+# Neovis model configuration — the ONLY file you edit to point at a new backend.
+#
+# The agent core is model-agnostic. To adapt Neovis to your company:
+#   1. set provider + model,
+#   2. set base_url to your internal proxy (or leave blank for the public API),
+#   3. put the API key in the env var named by api_key_env (never in this file).
+#
+# API keys are pulled from the environment. ${VAR} placeholders are expanded.
+
+llm:
+  provider: anthropic          # anthropic | openai (openai covers any OpenAI-compatible proxy)
+  model: claude-sonnet-4-5
+  base_url:                    # e.g. https://llm-proxy.yourfund.internal/v1  (blank = provider default)
+  api_key_env: NEOVIS_API_KEY
+
+# Voice is optional; text works with none. Filled in during Stage 2.
+voice:
+  asr_provider: none           # openai | faster-whisper | none
+  asr_model: whisper-1
+  tts_provider: none           # openai | edge-tts | none
+  tts_model: tts-1
+  tts_voice: alloy
+  base_url:
+  api_key_env: NEOVIS_API_KEY
