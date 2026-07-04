@@ -25,7 +25,7 @@ from claude_agent_sdk import (
 from .approval import ApprovalGateway
 from .audit import AuditLog
 from .config import AppConfig
-from .gate import AutoMode, build_pre_tool_use_hook
+from .gate import AutoMode, PageContext, build_post_tool_use_hook, build_pre_tool_use_hook
 
 SYSTEM_PROMPT = """\
 You are Neovis, a JARVIS-style operator running on a colleague's work computer at
@@ -42,7 +42,7 @@ the shell, the filesystem, the browser. Principles:
 
 def build_options(
     config: AppConfig,
-    pre_tool_use_hook,
+    hooks: dict,
     *,
     gateway_url: str | None = None,
     gateway_key: str | None = None,
@@ -69,8 +69,9 @@ def build_options(
         system_prompt=SYSTEM_PROMPT,
         # The gate runs as a PreToolUse hook so it fires for EVERY tool call,
         # regardless of permission mode (can_use_tool only fires when the engine
-        # decides a prompt is needed, which it often doesn't).
-        hooks={"PreToolUse": [HookMatcher(hooks=[pre_tool_use_hook])]},
+        # decides a prompt is needed, which it often doesn't). A PostToolUse hook
+        # captures page snapshots so the gate can read button labels.
+        hooks=hooks,
         permission_mode="default",
         # allowed_tools is a pre-approval list — leaving it empty keeps every
         # tool subject to the hook. disallowed_tools blocks tools outright.
@@ -104,12 +105,18 @@ class NeovisSession:
         self.audit = audit or AuditLog("neovis_audit.db")
         self.automode = AutoMode()
         self.approval = approval
-        pre_tool_use_hook = build_pre_tool_use_hook(
+        self.page = PageContext()
+        pre_hook = build_pre_tool_use_hook(
             config.policy, self.audit, approval, self.automode,
-            actor=actor, session_id=session_id,
+            page=self.page, actor=actor, session_id=session_id,
         )
+        post_hook = build_post_tool_use_hook(self.page)
+        hooks = {
+            "PreToolUse": [HookMatcher(hooks=[pre_hook])],
+            "PostToolUse": [HookMatcher(hooks=[post_hook])],
+        }
         self.options = build_options(
-            config, pre_tool_use_hook,
+            config, hooks,
             gateway_url=gateway_url, gateway_key=gateway_key,
             allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
             mcp_servers=mcp_servers,

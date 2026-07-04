@@ -9,17 +9,22 @@ policy:
 
 A denylisted shell command is a hard deny that approval cannot override.
 
-The decision is exposed to the Claude Agent SDK as a **PreToolUse hook**
-(:func:`build_pre_tool_use_hook`), which fires for *every* tool call regardless
-of permission mode — unlike ``can_use_tool``, which only fires when the engine
-decides a prompt is needed. :func:`build_can_use_tool` wraps the same logic for
-the callback API (and for unit tests). "Asking a human" is done by awaiting an
-:class:`ApprovalGateway` (Slack buttons on the phone, or the console).
+Browser clicks are the tricky case: chrome-devtools identifies elements by an
+opaque ``uid``, not their visible text, so "click Send" looks identical to
+"click a link". We close that gap with a :class:`PageContext` that a PostToolUse
+hook fills from each page snapshot (``uid → label``); the gate then looks up the
+clicked uid's label so a *Send* / *Submit* button is correctly classified
+OUTWARD.
+
+The decision runs as a **PreToolUse hook** (:func:`build_pre_tool_use_hook`),
+which fires for every tool call regardless of permission mode. "Asking a human"
+is done by awaiting an :class:`ApprovalGateway` (Slack buttons, or the console).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
 
@@ -46,13 +51,49 @@ _BROWSER_READ = {
     "navigate_page", "new_page", "list_pages", "select_page", "take_snapshot",
     "take_screenshot", "list_console_messages", "get_console_message",
     "list_network_requests", "get_network_request", "wait_for", "hover",
-    # NOTE: evaluate_script is deliberately NOT here — it runs arbitrary JS in the
-    # page (can click, submit, exfiltrate), so it falls through to LOCAL_WRITE.
+    # NOTE: evaluate_script is NOT here — it runs arbitrary JS (can click, submit,
+    # exfiltrate), so it falls through to LOCAL_WRITE.
 }
 _BROWSER_WRITE = {
     "click", "fill", "fill_form", "type_text", "drag", "press_key",
     "upload_file", "resize_page", "emulate",
 }
+
+
+# ── page context: uid → visible label, filled from browser snapshots ──────────
+_SNAPSHOT_RE = re.compile(r'uid=(\S+)\s+\w+\s+"([^"]*)"')
+
+
+@dataclass
+class PageContext:
+    """Maps chrome-devtools element uids to their visible labels."""
+
+    labels: dict[str, str] = field(default_factory=dict)
+
+    def update_from_snapshot(self, tool_response: Any) -> None:
+        text = _snapshot_text(tool_response)
+        for uid, label in _SNAPSHOT_RE.findall(text):
+            self.labels[uid] = label
+
+    def label_for(self, tool_input: dict[str, Any]) -> str:
+        uid = _element_uid(tool_input)
+        return self.labels.get(uid, "") if uid else ""
+
+
+def _snapshot_text(tool_response: Any) -> str:
+    if isinstance(tool_response, list):
+        return " ".join(
+            b.get("text", "") for b in tool_response if isinstance(b, dict)
+        )
+    return str(tool_response or "")
+
+
+def _element_uid(tool_input: dict[str, Any]) -> str:
+    for key in ("uid", "element_uid", "ref", "element"):
+        value = tool_input.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
 
 
 def _action(tool_name: str) -> str:
@@ -64,8 +105,18 @@ def _text_blob(tool_input: dict[str, Any]) -> str:
     return " ".join(str(v) for v in tool_input.values()).lower()
 
 
-def classify(tool_name: str, tool_input: dict[str, Any], policy: PolicyConfig) -> tuple[Consequence, str]:
-    """Map a tool call to a consequence tier plus a short human-readable reason."""
+def classify(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    policy: PolicyConfig,
+    *,
+    element_label: str = "",
+) -> tuple[Consequence, str]:
+    """Map a tool call to a consequence tier plus a short human-readable reason.
+
+    ``element_label`` is the visible text of the targeted browser element (looked
+    up from the page snapshot), so a click on a *Send* button reads as OUTWARD.
+    """
     if tool_name in _READ_TOOLS:
         return Consequence.READ, "read-only tool"
     if tool_name in _WRITE_TOOLS:
@@ -73,6 +124,8 @@ def classify(tool_name: str, tool_input: dict[str, Any], policy: PolicyConfig) -
 
     action = _action(tool_name)
     blob = _text_blob(tool_input)
+    if element_label:
+        blob = f"{blob} {element_label.lower()}"
     hits_outward = any(k.lower() in blob for k in policy.outward_keywords)
 
     if tool_name == "Bash" or action == "bash":
@@ -87,7 +140,8 @@ def classify(tool_name: str, tool_input: dict[str, Any], policy: PolicyConfig) -
         return Consequence.READ, "browser navigation / read"
     if action in _BROWSER_WRITE:
         if hits_outward:
-            return Consequence.OUTWARD, "browser action matches an outward keyword (e.g. Send/Submit)"
+            target = element_label or "element"
+            return Consequence.OUTWARD, f"browser action on {target!r} looks outward (e.g. Send/Submit)"
         return Consequence.LOCAL_WRITE, "browser interaction"
 
     if hits_outward:
@@ -128,6 +182,7 @@ def build_evaluator(
     approval: ApprovalGateway,
     automode: AutoMode,
     *,
+    page: PageContext | None = None,
     actor: str = "user",
     session_id: str = "desktop",
 ):
@@ -151,7 +206,8 @@ def build_evaluator(
                 record("DENYLIST", "denied", result=rule)
                 return Decision(False, f"blocked by denylist rule /{rule}/", "DENYLIST")
 
-        consequence, why = classify(tool_name, tool_input, policy)
+        element_label = page.label_for(tool_input) if page else ""
+        consequence, why = classify(tool_name, tool_input, policy, element_label=element_label)
 
         # 2) READ — allow after the allowlist check; never interrupt the user.
         if consequence is Consequence.READ:
@@ -186,25 +242,29 @@ def build_evaluator(
     return evaluate
 
 
+def _get(input_data: Any, key: str, default: Any = None) -> Any:
+    if isinstance(input_data, dict):
+        return input_data.get(key, default)
+    return getattr(input_data, key, default)
+
+
 def build_pre_tool_use_hook(
     policy: PolicyConfig,
     audit: AuditLog,
     approval: ApprovalGateway,
     automode: AutoMode,
     *,
+    page: PageContext | None = None,
     actor: str = "user",
     session_id: str = "desktop",
 ):
     """A PreToolUse hook for ClaudeAgentOptions.hooks — fires on every tool call."""
     evaluate = build_evaluator(
-        policy, audit, approval, automode, actor=actor, session_id=session_id
+        policy, audit, approval, automode, page=page, actor=actor, session_id=session_id
     )
 
     async def hook(input_data: Any, tool_use_id: Any, context: Any) -> dict:
-        get = input_data.get if isinstance(input_data, dict) else (lambda k, d=None: getattr(input_data, k, d))
-        tool_name = get("tool_name") or ""
-        tool_input = get("tool_input") or {}
-        decision = await evaluate(tool_name, tool_input)
+        decision = await evaluate(_get(input_data, "tool_name") or "", _get(input_data, "tool_input") or {})
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -216,18 +276,30 @@ def build_pre_tool_use_hook(
     return hook
 
 
+def build_post_tool_use_hook(page: PageContext):
+    """A PostToolUse hook that keeps the uid→label map current from snapshots."""
+
+    async def hook(input_data: Any, tool_use_id: Any, context: Any) -> dict:
+        if "snapshot" in (_get(input_data, "tool_name") or ""):
+            page.update_from_snapshot(_get(input_data, "tool_response"))
+        return {}
+
+    return hook
+
+
 def build_can_use_tool(
     policy: PolicyConfig,
     audit: AuditLog,
     approval: ApprovalGateway,
     automode: AutoMode,
     *,
+    page: PageContext | None = None,
     actor: str = "user",
     session_id: str = "desktop",
 ):
     """A can_use_tool callback (same logic) — used in unit tests and as a fallback."""
     evaluate = build_evaluator(
-        policy, audit, approval, automode, actor=actor, session_id=session_id
+        policy, audit, approval, automode, page=page, actor=actor, session_id=session_id
     )
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any):

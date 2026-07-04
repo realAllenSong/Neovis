@@ -12,6 +12,7 @@ from neovis.core.audit import AuditLog
 from neovis.core.gate import (
     AutoMode,
     Consequence,
+    PageContext,
     build_can_use_tool,
     build_pre_tool_use_hook,
     classify,
@@ -132,3 +133,37 @@ async def test_hook_denies_write_when_human_rejects(tmp_path):
     )
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert audit.recent()[0]["status"] == "rejected"
+
+
+# ── snapshot-aware browser Send detection (the hero-demo safety feature) ──────
+def test_snapshot_parse_and_send_button_is_outward():
+    page = PageContext()
+    page.update_from_snapshot([{"type": "text", "text":
+        'uid=1_4 textbox "To"\nuid=1_9 button "Send"\n'}])
+    assert page.labels["1_9"] == "Send"
+    assert page.labels["1_4"] == "To"
+
+    # Clicking the Send button (by uid) is OUTWARD once its label is known.
+    send = classify("mcp__chrome-devtools__click", {"uid": "1_9"}, PolicyConfig(),
+                    element_label=page.label_for({"uid": "1_9"}))
+    assert send[0] is Consequence.OUTWARD
+    # Clicking the To field is a plain local interaction.
+    tofield = classify("mcp__chrome-devtools__click", {"uid": "1_4"}, PolicyConfig(),
+                       element_label=page.label_for({"uid": "1_4"}))
+    assert tofield[0] is Consequence.LOCAL_WRITE
+
+
+async def test_send_click_gated_outward_even_in_auto_mode(tmp_path):
+    # Auto-mode is ON, but clicking Send must still reach approval (OUTWARD).
+    page = PageContext()
+    page.labels["1_9"] = "Send"
+    audit = AuditLog(tmp_path / "a.db")
+    hook = build_pre_tool_use_hook(
+        PolicyConfig(), audit, DenyAll(), AutoMode(active=True), page=page
+    )
+    out = await hook(
+        {"tool_name": "mcp__chrome-devtools__click", "tool_input": {"uid": "1_9"}}, "t", None
+    )
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    row = audit.recent()[0]
+    assert row["risk"] == "OUTWARD" and row["status"] == "rejected"
