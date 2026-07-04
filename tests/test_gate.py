@@ -9,7 +9,13 @@ import pytest
 
 from neovis.core.approval import AutoApprove, DenyAll
 from neovis.core.audit import AuditLog
-from neovis.core.gate import AutoMode, Consequence, build_can_use_tool, classify
+from neovis.core.gate import (
+    AutoMode,
+    Consequence,
+    build_can_use_tool,
+    build_pre_tool_use_hook,
+    classify,
+)
 from neovis.core.policy import PolicyConfig
 
 
@@ -106,3 +112,21 @@ async def test_outward_approved_executes(tmp_path):
     assert _allowed(res)
     row = audit.recent()[0]
     assert row["tool"] == "Bash" and row["status"] == "ok"
+
+
+# ── PreToolUse hook output shape (what the SDK actually consumes) ─────────────
+async def test_hook_allows_read(tmp_path):
+    audit = AuditLog(tmp_path / "a.db")
+    hook = build_pre_tool_use_hook(PolicyConfig(), audit, DenyAll(), AutoMode())
+    out = await hook({"tool_name": "Read", "tool_input": {"file_path": "/x"}}, "tid", None)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
+async def test_hook_denies_write_when_human_rejects(tmp_path):
+    audit = AuditLog(tmp_path / "a.db")
+    hook = build_pre_tool_use_hook(PolicyConfig(), audit, DenyAll(), AutoMode())
+    out = await hook(
+        {"tool_name": "Write", "tool_input": {"file_path": "/x", "content": "y"}}, "tid", None
+    )
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert audit.recent()[0]["status"] == "rejected"
