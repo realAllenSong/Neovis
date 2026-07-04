@@ -36,14 +36,18 @@ class Consequence(IntEnum):
     OUTWARD = 2       # leave the machine / irreversible — send, submit, delete, push
 
 
-_READ_TOOLS = {"Read", "Grep", "Glob", "NotebookRead", "WebSearch", "TodoWrite"}
+_READ_TOOLS = {
+    "Read", "Grep", "Glob", "NotebookRead", "WebSearch", "TodoWrite",
+    "ToolSearch", "ListMcpResources", "ReadMcpResource",  # read-only meta-tools
+}
 _WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
 _BROWSER_READ = {
     "navigate_page", "new_page", "list_pages", "select_page", "take_snapshot",
     "take_screenshot", "list_console_messages", "get_console_message",
     "list_network_requests", "get_network_request", "wait_for", "hover",
-    "evaluate_script",
+    # NOTE: evaluate_script is deliberately NOT here — it runs arbitrary JS in the
+    # page (can click, submit, exfiltrate), so it falls through to LOCAL_WRITE.
 }
 _BROWSER_WRITE = {
     "click", "fill", "fill_form", "type_text", "drag", "press_key",

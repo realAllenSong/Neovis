@@ -34,6 +34,8 @@ from neovis.core.policy import PolicyConfig
     ("mcp__chrome-devtools__take_snapshot", {}, Consequence.READ),
     ("mcp__chrome-devtools__click", {"element": "Compose button"}, Consequence.LOCAL_WRITE),
     ("mcp__chrome-devtools__click", {"element": "Send email button"}, Consequence.OUTWARD),
+    ("mcp__chrome-devtools__evaluate_script", {"function": "() => document.title"}, Consequence.LOCAL_WRITE),
+    ("ToolSearch", {"query": "browser"}, Consequence.READ),
 ])
 def test_classify(tool, inp, expected):
     assert classify(tool, inp, PolicyConfig())[0] is expected
