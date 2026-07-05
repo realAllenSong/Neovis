@@ -92,7 +92,10 @@ class NeovisDaemon:
             tasks.append(asyncio.create_task(self._run_slack()))
         else:
             self._set(slack="off", slack_msg="add tokens below")
-        tasks.append(asyncio.create_task(self._run_voice(settings)))
+        if settings.get("voice_enabled", True):
+            tasks.append(asyncio.create_task(self._run_voice(settings)))
+        else:
+            self._set(voice="off", voice_msg="off")
         try:
             await self._stop
         finally:

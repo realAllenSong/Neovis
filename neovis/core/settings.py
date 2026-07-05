@@ -15,7 +15,8 @@ import yaml
 SETTINGS_PATH = Path.home() / ".neovis" / "settings.yaml"
 
 DEFAULTS: dict[str, Any] = {
-    "hotkey": "cmd_r",              # push-to-talk key
+    "voice_enabled": True,         # run the desktop push-to-talk voice loop
+    "hotkey": "cmd_r",             # push-to-talk key
     "voice": "sky",                # sky / adam / emma / george
     "hands_free": False,           # continuous VAD + barge-in instead of hold-to-talk
     "hotwords": [],                # ASR contextual-bias words

@@ -42,7 +42,7 @@ _VOICES = [("Sky · US ♀", "sky"), ("Adam · US ♂", "adam"),
            ("Emma · UK ♀", "emma"), ("George · UK ♂", "george")]
 
 _QSS = """
-* { font-family: -apple-system, 'SF Pro Text', 'Segoe UI', sans-serif; color: #E8E8EA; }
+* { color: #E8E8EA; }
 QWidget#root { background: #16171B; }
 QLabel#title { font-size: 26px; font-weight: 600; }
 QLabel#subtitle { color: #8A8D96; font-size: 13px; }
@@ -52,7 +52,9 @@ QFrame#divider { background: #2A2C33; max-height: 1px; }
 QComboBox, QLineEdit { background: #23252B; border: 1px solid #33363E; border-radius: 8px;
     padding: 7px 10px; font-size: 13px; }
 QComboBox:hover, QLineEdit:focus { border-color: #4C6EF5; }
+QComboBox:disabled, QLineEdit:disabled { color: #55585F; background: #1B1C21; border-color: #26282E; }
 QCheckBox { font-size: 13px; }
+QCheckBox:disabled, QLabel:disabled { color: #55585F; }
 QPushButton#primary { border: none; border-radius: 12px; padding: 14px; font-size: 15px;
     font-weight: 600; background: #3B8A4E; color: white; }
 QPushButton#primary[running="true"] { background: #B5423A; }
@@ -137,15 +139,26 @@ class NeovisWindow(QWidget):
         root.addWidget(self._divider())
         root.addWidget(self._label("SETTINGS", "section"))
 
-        self.cb_key = self._combo(_HOTKEYS, self.settings.get("hotkey", "cmd_r"))
-        root.addLayout(self._field("Push-to-talk key", self.cb_key))
-        self.cb_voice = self._combo(_VOICES, self.settings.get("voice", "sky"))
-        root.addLayout(self._field("Voice", self.cb_voice))
+        self.chk_voice = QCheckBox("Enable voice (hold a key to talk)")
+        self.chk_voice.setChecked(bool(self.settings.get("voice_enabled", True)))
+        self.chk_voice.stateChanged.connect(self._on_voice_toggle)
+        root.addWidget(self.chk_voice)
 
+        # Voice settings live in one box so they dim together when voice is off.
+        self.voice_box = QWidget()
+        vbox = QVBoxLayout(self.voice_box)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(16)
+        self.cb_key = self._combo(_HOTKEYS, self.settings.get("hotkey", "cmd_r"))
+        vbox.addLayout(self._field("Push-to-talk key", self.cb_key))
+        self.cb_voice = self._combo(_VOICES, self.settings.get("voice", "sky"))
+        vbox.addLayout(self._field("Voice", self.cb_voice))
         self.chk_hf = QCheckBox("Hands-free (talk anytime, barge-in)")
         self.chk_hf.setChecked(bool(self.settings.get("hands_free")))
         self.chk_hf.stateChanged.connect(self._save)
-        root.addWidget(self.chk_hf)
+        vbox.addWidget(self.chk_hf)
+        root.addWidget(self.voice_box)
+        self._sync_voice_controls()
 
         root.addWidget(self._divider())
         root.addWidget(self._label("SLACK (optional — for phone control)", "section"))
@@ -204,6 +217,7 @@ class NeovisWindow(QWidget):
     # ── behaviour ────────────────────────────────────────────────────────────
     def _current_settings(self) -> dict:
         return {
+            "voice_enabled": self.chk_voice.isChecked(),
             "hotkey": self.cb_key.currentData(),
             "voice": self.cb_voice.currentData(),
             "hands_free": self.chk_hf.isChecked(),
@@ -211,6 +225,14 @@ class NeovisWindow(QWidget):
             "slack_bot_token": self.ed_bot.text().strip(),
             "slack_app_token": self.ed_app.text().strip(),
         }
+
+    def _sync_voice_controls(self) -> None:
+        """Grey out the voice settings when voice is switched off."""
+        self.voice_box.setEnabled(self.chk_voice.isChecked())
+
+    def _on_voice_toggle(self, *_) -> None:
+        self._sync_voice_controls()
+        self._save()
 
     def _save(self, *_) -> None:
         self.settings = self._current_settings()
