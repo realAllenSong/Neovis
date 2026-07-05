@@ -259,41 +259,51 @@ class VoiceLoop:
             stream.stop()
 
 
-async def _run(args) -> int:
+async def build_voice_loop(*, voice="sky", hotwords=None, audit_db="neovis_audit.db", approval=None):
+    """Assemble a connected VoiceLoop (session + gate + ASR + TTS + router +
+    watcher). Returns (loop, cleanup, router_available). Reused by the CLI and GUI."""
     try:
         config = load_config()
         config.llm.model = config.llm.model or ""
     except Exception:
         config = AppConfig(llm=ModelConfig(provider="anthropic", model=""))
 
-    tts = KokoroTTS(voice=args.voice)
-
-    # Proactive watcher: speak aloud when a background job finishes.
-    _watch_wav = Path(tempfile.gettempdir()) / "neovis_watch.wav"
+    tts = KokoroTTS(voice=voice)
+    watch_wav = Path(tempfile.gettempdir()) / "neovis_watch.wav"
 
     async def _notify(result):
         line = f"Your job {result.note or 'in the background'} is done."
         try:
-            tts.synthesize(line, _watch_wav)
-            _play(str(_watch_wav))
+            tts.synthesize(line, watch_wav)
+            _play(str(watch_wav))
         except Exception:
             pass
 
     manager = WatchManager(_notify)
     session = NeovisSession(
-        config, approval=ConsoleApproval(), audit=AuditLog(args.audit_db),
+        config, approval=approval or ConsoleApproval(), audit=AuditLog(audit_db),
         actor="voice", session_id="desktop-voice",
         mcp_servers={"neovis-watch": build_watch_mcp(manager, policy=config.policy)},
     )
     await session.connect()
-    asr = TransducerASR(hotwords=args.hotword or None)
+    asr = TransducerASR(hotwords=hotwords or None)
     router = IntentRouter()
     await router.connect()
-    if router.available:
-        print("Intent router: Haiku (fast tier)")
-    else:
-        print("Intent router: rule-based fallback (no model reachable)")
     loop = VoiceLoop(session, asr, tts, router=router)
+
+    async def cleanup():
+        await manager.stop()
+        await router.disconnect()
+        await session.disconnect()
+
+    return loop, cleanup, router.available
+
+
+async def _run(args) -> int:
+    loop, cleanup, router_ok = await build_voice_loop(
+        voice=args.voice, hotwords=args.hotword, audit_db=args.audit_db
+    )
+    print("Intent router:", "Haiku (fast tier)" if router_ok else "rule-based fallback")
     try:
         if args.type:
             await loop.run_typed()
@@ -302,21 +312,15 @@ async def _run(args) -> int:
         else:
             await loop.run_push_to_talk(key_name=args.key)
     finally:
-        await manager.stop()
-        await router.disconnect()
-        await session.disconnect()
+        await cleanup()
     return 0
 
 
 def _load_settings() -> dict:
     """Editable defaults at ~/.neovis/settings.yaml (CLI flags override)."""
-    import yaml
+    from ...core.settings import load
 
-    path = Path.home() / ".neovis" / "settings.yaml"
-    try:
-        return (yaml.safe_load(path.read_text()) or {}) if path.exists() else {}
-    except Exception:
-        return {}
+    return load()
 
 
 def main() -> None:

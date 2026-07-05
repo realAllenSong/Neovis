@@ -11,13 +11,18 @@ from pathlib import Path
 
 from . import MODELS_DIR
 
-DEFAULT_VAD_MODEL = MODELS_DIR / "silero_vad.onnx"
+TEN_VAD_MODEL = MODELS_DIR / "ten-vad.onnx"
+SILERO_VAD_MODEL = MODELS_DIR / "silero_vad.onnx"
 
 
 class VAD:
+    """Voice activity detector. Defaults to TEN VAD (newer, more accurate than
+    silero on noisy/short speech); falls back to silero if TEN isn't present."""
+
     def __init__(
         self,
-        model_path: str | Path = DEFAULT_VAD_MODEL,
+        engine: str | None = None,
+        model_path: str | Path | None = None,
         *,
         sample_rate: int = 16000,
         threshold: float = 0.5,
@@ -26,11 +31,16 @@ class VAD:
     ):
         import sherpa_onnx
 
+        if engine is None:
+            engine = "ten" if TEN_VAD_MODEL.exists() else "silero"
+        self.engine = engine
+
         cfg = sherpa_onnx.VadModelConfig()
-        cfg.silero_vad.model = str(model_path)
-        cfg.silero_vad.threshold = threshold
-        cfg.silero_vad.min_silence_duration = min_silence
-        cfg.silero_vad.min_speech_duration = min_speech
+        sub = cfg.ten_vad if engine == "ten" else cfg.silero_vad
+        sub.model = str(model_path or (TEN_VAD_MODEL if engine == "ten" else SILERO_VAD_MODEL))
+        sub.threshold = threshold
+        sub.min_silence_duration = min_silence
+        sub.min_speech_duration = min_speech
         cfg.sample_rate = sample_rate
         self.sample_rate = sample_rate
         self._vad = sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=30)
