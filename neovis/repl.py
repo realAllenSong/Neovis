@@ -76,15 +76,24 @@ async def _run(args) -> int:
     mcp_servers = None
     disallowed = None
     if browser:
-        # Preflight: a common trap is running the launch command while Chrome is
-        # already open, which silently ignores --remote-debugging-port.
-        if args.browser_url and not _browser_url_reachable(args.browser_url):
-            print(f"Chrome debug port not reachable at {args.browser_url}.")
-            print("Fix — QUIT Chrome completely first (Cmd-Q), THEN run:")
-            print('  open -a "Google Chrome" --args --remote-debugging-port=9222')
-            print("(the flag is ignored if Chrome is already running).")
+        url = args.browser_url
+        if not url:
+            # Auto-launch the dedicated, persistent Neovis Chrome profile.
+            from .mcp.browser import NEOVIS_CHROME_PROFILE, launch_neovis_chrome
+
+            print(f"Launching Neovis Chrome (profile: {NEOVIS_CHROME_PROFILE}) …")
+            if not launch_neovis_chrome(9222):
+                print("Could not start Chrome with a debug port. Is Google Chrome installed?")
+                return 2
+            url = "http://127.0.0.1:9222"
+            print("First run? Log into Gmail (and any sites Neovis needs) in that window.")
+        elif not _browser_url_reachable(url):
+            print(f"Chrome debug port not reachable at {url}.")
+            print("Fix — QUIT Chrome completely (Cmd-Q), THEN relaunch with:")
+            print("  --user-data-dir=<dir> --remote-debugging-port=9222")
+            print("(Chrome 136+ blocks debugging on the default profile; use a dedicated one.)")
             return 2
-        mcp_servers = chrome_devtools_mcp(browser_url=args.browser_url)
+        mcp_servers = chrome_devtools_mcp(browser_url=url)
         # In browser mode the agent must use the browser tools, not the shell.
         disallowed = ["Bash"]
 
