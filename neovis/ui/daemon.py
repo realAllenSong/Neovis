@@ -29,6 +29,8 @@ def _friendly(exc: Exception) -> str:
     low = text.lower()
     if "portaudio" in low or "no default input" in low or "invalid number of channels" in low:
         return "no microphone found"
+    if "input monitoring" in low or "accessibility" in low or "keyboard permission" in low:
+        return "grant keyboard access (Accessibility)"
     if "authentication" in low or "oauth" in low or "credentials" in low or "401" in low:
         return "Claude sign-in needed"
     return text.splitlines()[0][:60]

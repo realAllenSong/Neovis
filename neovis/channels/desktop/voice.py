@@ -165,53 +165,42 @@ class VoiceLoop:
     async def run_push_to_talk(self, key_name: str = "cmd_r", samplerate: int = 16000) -> None:
         import numpy as np
         import sounddevice as sd
-        from pynput import keyboard
 
-        ptt = getattr(keyboard.Key, key_name, None)
-        if ptt is None:
-            print(f"Unknown hotkey {key_name!r}; use e.g. cmd_r, alt_r, ctrl_r.")
-            return
+        from .hotkey import HotkeyListener
 
         frames: list = []
         state = {"recording": False}
+        pending_audio: list = []  # raw clips; ASR runs in this loop, never in a callback
 
         def audio_cb(indata, _n, _t, _s):
             if state["recording"]:
                 frames.append(indata.copy())
 
+        def on_press():
+            frames.clear()
+            state["recording"] = True
+            print("● listening…")
+
+        def on_release():
+            state["recording"] = False
+            if frames:
+                pending_audio.append(np.concatenate(frames, axis=0).flatten())
+
+        listener = HotkeyListener(key_name, on_press, on_release)
+        listener.start()  # raises with a friendly message if the OS denies the tap
         stream = sd.InputStream(samplerate=samplerate, channels=1, dtype="float32", callback=audio_cb)
         stream.start()
-        loop = asyncio.get_event_loop()
-        print(f"Push-to-talk: hold [{key_name}] and speak; release to send. Esc quits.")
-
-        pending: list = []
-
-        def on_press(k):
-            if k == ptt and not state["recording"]:
-                frames.clear()
-                state["recording"] = True
-                print("● listening…")
-
-        def on_release(k):
-            if k == ptt and state["recording"]:
-                state["recording"] = False
-                if frames:
-                    audio = np.concatenate(frames, axis=0).flatten()
-                    text = self.asr.transcribe_samples(audio, samplerate)
+        print(f"Push-to-talk: hold [{key_name}] and speak; release to send. Ctrl-C quits.")
+        try:
+            while True:
+                if pending_audio:
+                    text = self.asr.transcribe_samples(pending_audio.pop(0), samplerate)
                     print("you:", text or "(nothing heard)")
                     if text.strip():
-                        pending.append(text)
-            if k == keyboard.Key.esc:
-                return False
-
-        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        listener.start()
-        try:
-            while listener.running:
-                if pending:
-                    text = pending.pop(0)
-                    print("neovis>", await self.handle_utterance(text))
+                        print("neovis>", await self.handle_utterance(text))
                 await asyncio.sleep(0.05)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
         finally:
             listener.stop()
             stream.stop()
