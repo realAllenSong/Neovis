@@ -153,6 +153,34 @@ def test_snapshot_parse_and_send_button_is_outward():
     assert tofield[0] is Consequence.LOCAL_WRITE
 
 
+async def test_browser_click_not_auto_approved_in_auto_mode(tmp_path):
+    # Fail-safe: even with auto-mode ON, a browser click must reach approval
+    # (it could submit/send). DenyAll proves it is not silently auto-allowed.
+    reg_page = PageContext()  # no label known → would classify LOCAL_WRITE
+    audit = AuditLog(tmp_path / "a.db")
+    hook = build_pre_tool_use_hook(
+        PolicyConfig(), audit, DenyAll(), AutoMode(active=True), page=reg_page
+    )
+    out = await hook(
+        {"tool_name": "mcp__chrome-devtools__click", "tool_input": {"uid": "x1"}}, "t", None
+    )
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert audit.recent()[0]["status"] == "rejected"
+
+
+async def test_local_file_write_still_auto_approved_in_auto_mode(tmp_path):
+    # Auto-mode still covers ordinary file writes (the series case it's meant for).
+    audit = AuditLog(tmp_path / "a.db")
+    hook = build_pre_tool_use_hook(
+        PolicyConfig(), audit, DenyAll(), AutoMode(active=True)
+    )
+    out = await hook(
+        {"tool_name": "Write", "tool_input": {"file_path": "/x", "content": "y"}}, "t", None
+    )
+    assert out["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert audit.recent()[0]["approver"] == "auto-mode"
+
+
 async def test_send_click_gated_outward_even_in_auto_mode(tmp_path):
     # Auto-mode is ON, but clicking Send must still reach approval (OUTWARD).
     page = PageContext()

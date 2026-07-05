@@ -92,6 +92,9 @@ def build_options(
         disallowed_tools=disallowed_tools or [],
         mcp_servers=mcp_servers or {},
         setting_sources=[],              # gate is the sole authority
+        # Browser snapshots of heavy web apps (Gmail, etc.) can exceed the 1 MB
+        # default and break the control stream; give the buffer generous room.
+        max_buffer_size=64 * 1024 * 1024,
         env=env,
         cwd=os.getcwd(),
     )

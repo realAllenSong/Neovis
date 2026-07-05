@@ -219,7 +219,15 @@ def build_evaluator(
             return Decision(True, why, "READ")
 
         # 3) LOCAL_WRITE inside an approved series → allow silently.
-        if consequence is Consequence.LOCAL_WRITE and automode.active:
+        #    Fail-safe: browser interactions are NEVER auto-approved — a click can
+        #    submit, send, buy, or delete, and we can't reliably tell which from an
+        #    opaque element uid. Auto-mode covers local file writes, not the browser.
+        is_browser_write = _action(tool_name) in _BROWSER_WRITE
+        if (
+            consequence is Consequence.LOCAL_WRITE
+            and automode.active
+            and not is_browser_write
+        ):
             record("LOCAL_WRITE", "ok", approver="auto-mode")
             return Decision(True, "auto-mode", "LOCAL_WRITE")
 
