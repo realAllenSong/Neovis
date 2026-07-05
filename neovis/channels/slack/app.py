@@ -27,6 +27,7 @@ from ...core.approval import ApprovalDecision, ApprovalGateway, ApprovalRequest
 from ...core.audit import AuditLog
 from ...core.config import AppConfig, load_config
 from ...core.session import NeovisSession
+from ...core.watch import WatchManager, build_watch_mcp
 from .blocks import approval_blocks, decided_blocks, to_mrkdwn
 
 
@@ -81,12 +82,22 @@ _SESSIONS: dict[str, NeovisSession] = {}
 async def _get_session(config: AppConfig, audit: AuditLog, user: str, channel: str, client) -> NeovisSession:
     session = _SESSIONS.get(user)
     if session is None:
+        async def notify(result):
+            emoji = "✅" if result.ok else "⚠️"
+            body = f"🔔 *Watch finished* — {result.note or result.target}\n{emoji} {result.detail}"
+            try:
+                await client.chat_postMessage(channel=channel, text=to_mrkdwn(body))
+            except Exception:
+                pass
+
+        manager = WatchManager(notify)
         session = NeovisSession(
             config,
             approval=SlackApproval(client, channel),
             audit=audit,
             actor=user,
             session_id=f"slack:{user}",
+            mcp_servers={"neovis-watch": build_watch_mcp(manager, policy=config.policy)},
         )
         await session.connect()
         _SESSIONS[user] = session

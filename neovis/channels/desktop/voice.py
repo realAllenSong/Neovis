@@ -27,6 +27,7 @@ from ...core.audit import AuditLog
 from ...core.config import AppConfig, ModelConfig, load_config
 from ...core.router import IntentRouter
 from ...core.session import NeovisSession
+from ...core.watch import WatchManager, build_watch_mcp
 from ...voice.asr import TransducerASR
 from ...voice.tts import VOICES, KokoroTTS
 
@@ -196,13 +197,27 @@ async def _run(args) -> int:
     except Exception:
         config = AppConfig(llm=ModelConfig(provider="anthropic", model=""))
 
+    tts = KokoroTTS(voice=args.voice)
+
+    # Proactive watcher: speak aloud when a background job finishes.
+    _watch_wav = Path(tempfile.gettempdir()) / "neovis_watch.wav"
+
+    async def _notify(result):
+        line = f"Your job {result.note or 'in the background'} is done."
+        try:
+            tts.synthesize(line, _watch_wav)
+            _play(str(_watch_wav))
+        except Exception:
+            pass
+
+    manager = WatchManager(_notify)
     session = NeovisSession(
         config, approval=ConsoleApproval(), audit=AuditLog(args.audit_db),
         actor="voice", session_id="desktop-voice",
+        mcp_servers={"neovis-watch": build_watch_mcp(manager, policy=config.policy)},
     )
     await session.connect()
     asr = TransducerASR(hotwords=args.hotword or None)
-    tts = KokoroTTS(voice=args.voice)
     router = IntentRouter()
     await router.connect()
     if router.available:
