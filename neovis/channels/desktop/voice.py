@@ -32,9 +32,24 @@ from ...voice.asr import TransducerASR
 from ...voice.tts import VOICES, KokoroTTS
 
 
-def _play(wav: str) -> None:
+def _play_cmd(wav: str) -> list[str] | None:
+    """A subprocess player command (interruptible), or None to fall back."""
     if sys.platform == "darwin":
-        subprocess.run(["afplay", wav])
+        return ["afplay", wav]
+    for player in (
+        ["aplay", "-q", wav],
+        ["paplay", wav],
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", wav],
+    ):
+        if shutil.which(player[0]):
+            return player
+    return None
+
+
+def _play(wav: str) -> None:
+    cmd = _play_cmd(wav)
+    if cmd:
+        subprocess.run(cmd)
         return
     if sys.platform.startswith("win"):
         try:
@@ -44,14 +59,6 @@ def _play(wav: str) -> None:
             return
         except Exception:
             pass
-    for player in (
-        ["aplay", "-q", wav],
-        ["paplay", wav],
-        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", wav],
-    ):
-        if shutil.which(player[0]):
-            subprocess.run(player)
-            return
     print("(no audio player found — install ffmpeg, alsa-utils, or pulseaudio)")
 
 
@@ -68,10 +75,30 @@ class VoiceLoop:
         self.tts = tts
         self.router = router  # IntentRouter (Haiku) or None → rule fallback
         self._wav = Path(tempfile.gettempdir()) / "neovis_say.wav"
+        self._playing = None          # subprocess.Popen while speaking (barge-in)
+        self._speak_blocking = True   # hands-free flips this so we keep listening
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str, *, blocking: bool | None = None) -> None:
+        if blocking is None:
+            blocking = self._speak_blocking
         self.tts.synthesize(text, self._wav)
-        _play(str(self._wav))
+        cmd = _play_cmd(str(self._wav))
+        if cmd is None:
+            _play(str(self._wav))     # blocking fallback (e.g. Windows winsound)
+            return
+        if blocking:
+            subprocess.run(cmd)
+        else:
+            self._playing = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    @property
+    def speaking(self) -> bool:
+        return self._playing is not None and self._playing.poll() is None
+
+    def stop_speaking(self) -> None:
+        if self._playing is not None and self._playing.poll() is None:
+            self._playing.terminate()
+        self._playing = None
 
     async def handle_utterance(self, text: str) -> str:
         # The fast model (Haiku) decides what this means; the big model executes.
@@ -189,6 +216,48 @@ class VoiceLoop:
             listener.stop()
             stream.stop()
 
+    async def run_hands_free(self, samplerate: int = 16000) -> None:
+        """Continuous VAD-segmented listening with barge-in: no key to hold, and
+        speaking stops the moment you start talking. Best with headphones — a
+        speaker's audio leaking into the mic will trip the barge-in (echo)."""
+        import queue
+
+        import sounddevice as sd
+
+        from ...voice.vad import VAD
+
+        vad = VAD(sample_rate=samplerate)
+        self._speak_blocking = False  # keep listening while Neovis talks
+        q: "queue.Queue" = queue.Queue()
+
+        def audio_cb(indata, _n, _t, _s):
+            q.put(indata.copy())
+
+        stream = sd.InputStream(
+            samplerate=samplerate, channels=1, dtype="float32", blocksize=512, callback=audio_cb
+        )
+        stream.start()
+        print("Hands-free: just talk (headphones recommended for barge-in). Ctrl-C to quit.")
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.to_thread(q.get, True, 0.2)
+                except queue.Empty:
+                    continue
+                frames = chunk.flatten()
+                vad.accept(frames)
+                if self.speaking and vad.is_speaking():
+                    self.stop_speaking()  # barge-in
+                for seg in vad.segments():
+                    text = self.asr.transcribe_samples(seg, samplerate)
+                    if text.strip():
+                        print("you:", text)
+                        print("neovis>", await self.handle_utterance(text))
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            stream.stop()
+
 
 async def _run(args) -> int:
     try:
@@ -228,9 +297,12 @@ async def _run(args) -> int:
     try:
         if args.type:
             await loop.run_typed()
+        elif args.hands_free:
+            await loop.run_hands_free()
         else:
             await loop.run_push_to_talk(key_name=args.key)
     finally:
+        await manager.stop()
         await router.disconnect()
         await session.disconnect()
     return 0
@@ -251,6 +323,8 @@ def main() -> None:
     st = _load_settings()
     p = argparse.ArgumentParser(prog="neovis-voice", description="Desktop voice assistant.")
     p.add_argument("--type", action="store_true", help="type instead of speaking (no mic)")
+    p.add_argument("--hands-free", action="store_true",
+                   help="continuous VAD listening with barge-in (no key; headphones recommended)")
     p.add_argument("--key", default=st.get("hotkey", "cmd_r"),
                    help="push-to-talk key (cmd_r/alt_r/ctrl_r/f5/…); default from settings.yaml")
     p.add_argument("--voice", default=st.get("voice", "sky"), help="Kokoro voice: sky/adam/emma/george")
