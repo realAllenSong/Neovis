@@ -46,19 +46,52 @@ def _print_audit(audit: AuditLog) -> None:
     print("──────────────────\n")
 
 
+def _browser_url_reachable(url: str) -> bool:
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(url.rstrip("/") + "/json/version", timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+def _trace_tool(name: str, tool_input: dict) -> None:
+    """Live one-line trace of a tool the agent is invoking."""
+    short = name.rsplit("__", 1)[-1]
+    detail = ""
+    for key in ("url", "command", "file_path", "path", "value", "uid", "query"):
+        if tool_input.get(key):
+            detail = f"{key}={str(tool_input[key])[:60]}"
+            break
+    print(f"   · {short} {detail}".rstrip())
+
+
 async def _run(args) -> int:
     config = _load_config()
     audit = AuditLog(args.audit_db)
     approval = AutoApprove() if args.auto_approve else ConsoleApproval()
 
+    browser = bool(args.browser or args.browser_url)
     mcp_servers = None
-    if args.browser or args.browser_url:
+    disallowed = None
+    if browser:
+        # Preflight: a common trap is running the launch command while Chrome is
+        # already open, which silently ignores --remote-debugging-port.
+        if args.browser_url and not _browser_url_reachable(args.browser_url):
+            print(f"Chrome debug port not reachable at {args.browser_url}.")
+            print("Fix — QUIT Chrome completely first (Cmd-Q), THEN run:")
+            print('  open -a "Google Chrome" --args --remote-debugging-port=9222')
+            print("(the flag is ignored if Chrome is already running).")
+            return 2
         mcp_servers = chrome_devtools_mcp(browser_url=args.browser_url)
+        # In browser mode the agent must use the browser tools, not the shell.
+        disallowed = ["Bash"]
 
     session = NeovisSession(
         config, approval=approval, audit=audit,
         gateway_url=args.gateway_url, gateway_key=args.gateway_key,
-        mcp_servers=mcp_servers,
+        mcp_servers=mcp_servers, disallowed_tools=disallowed, browser=browser,
     )
     try:
         await session.connect()
@@ -66,7 +99,10 @@ async def _run(args) -> int:
         print(f"Startup failed: {exc}")
         return 2
 
-    print("Neovis ready. Type a request, or /audit, /quit.\n")
+    print("Neovis ready. Type a request, or /audit, /quit.")
+    if browser:
+        print("Browser attached — watch your Chrome window; steps trace below.")
+    print()
     try:
         while True:
             try:
@@ -82,7 +118,8 @@ async def _run(args) -> int:
                 _print_audit(audit)
                 continue
             try:
-                print("neovis>", await session.send(line))
+                out = await session.send(line, on_tool=_trace_tool)
+                print("neovis>", out)
             except Exception as exc:
                 print(f"(error) {exc}")
     finally:

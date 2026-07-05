@@ -20,6 +20,7 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     TextBlock,
+    ToolUseBlock,
 )
 
 from .approval import ApprovalGateway
@@ -40,6 +41,17 @@ the shell, the filesystem, the browser. Principles:
 - Keep replies short; the user is often on their phone.
 """
 
+BROWSER_GUIDANCE = """
+
+BROWSER MODE: a Chrome browser is ALREADY open and connected through the
+chrome-devtools tools. Act in it ONLY with those tools — navigate_page,
+take_snapshot, click, fill, fill_form, hover, take_screenshot. To open a site,
+call navigate_page (never a shell command). NEVER launch, relaunch, restart, or
+check Chrome, and never try to set up remote debugging — it is already done.
+Take a snapshot before interacting so you have element uids. Work in small,
+observable steps.
+"""
+
 def build_options(
     config: AppConfig,
     hooks: dict,
@@ -49,6 +61,7 @@ def build_options(
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
     mcp_servers: dict | None = None,
+    browser: bool = False,
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions pointing the engine at the model endpoint."""
     env = dict(os.environ)
@@ -66,7 +79,7 @@ def build_options(
 
     return ClaudeAgentOptions(
         model=config.llm.model or None,   # empty => engine/subscription default
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT + (BROWSER_GUIDANCE if browser else ""),
         # The gate runs as a PreToolUse hook so it fires for EVERY tool call,
         # regardless of permission mode (can_use_tool only fires when the engine
         # decides a prompt is needed, which it often doesn't). A PostToolUse hook
@@ -100,6 +113,7 @@ class NeovisSession:
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
         mcp_servers: dict | None = None,
+        browser: bool = False,
     ):
         self.config = config
         self.audit = audit or AuditLog("neovis_audit.db")
@@ -119,7 +133,7 @@ class NeovisSession:
             config, hooks,
             gateway_url=gateway_url, gateway_key=gateway_key,
             allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
-            mcp_servers=mcp_servers,
+            mcp_servers=mcp_servers, browser=browser,
         )
         self.client = ClaudeSDKClient(options=self.options)
 
@@ -129,8 +143,12 @@ class NeovisSession:
     async def disconnect(self) -> None:
         await self.client.disconnect()
 
-    async def send(self, message: str) -> str:
-        """Run one top-level turn; auto-mode is scoped to this turn only."""
+    async def send(self, message: str, on_tool=None) -> str:
+        """Run one top-level turn; auto-mode is scoped to this turn only.
+
+        ``on_tool(name, input)`` is called for each tool the agent invokes, so a
+        caller can show a live trace of what Neovis is doing.
+        """
         self.automode.reset()
         await self.client.query(message)
         parts: list[str] = []
@@ -139,6 +157,8 @@ class NeovisSession:
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         parts.append(block.text)
+                    elif isinstance(block, ToolUseBlock) and on_tool:
+                        on_tool(block.name, block.input)
             elif isinstance(msg, ResultMessage):
                 break
         return "".join(parts).strip()
