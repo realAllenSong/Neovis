@@ -13,6 +13,33 @@ from . import MODELS_DIR
 
 DEFAULT_KOKORO_DIR = MODELS_DIR / "kokoro-en-v0_19"
 
+# Named Kokoro voices (sherpa-onnx kokoro-en-v0_19 speaker ids).
+# name -> (sid, accent, gender)
+VOICES: dict[str, tuple[int, str, str]] = {
+    "sky": (4, "american", "female"),
+    "adam": (5, "american", "male"),
+    "emma": (7, "british", "female"),
+    "george": (9, "british", "male"),
+}
+DEFAULT_VOICE = "sky"
+
+
+def resolve_voice(
+    *, name: str | None = None, accent: str | None = None, gender: str | None = None
+) -> tuple[int, str] | None:
+    """Resolve a voice by name, or by (accent, gender). Returns (sid, name)."""
+    if name and name.lower() in VOICES:
+        return VOICES[name.lower()][0], name.lower()
+    if accent or gender:
+        acc = "british" if accent and any(
+            w in accent.lower() for w in ("brit", "uk", "england", "english")
+        ) else "american"
+        gen = "male" if gender and gender.lower().startswith("m") else "female"
+        for nm, (sid, a, g) in VOICES.items():
+            if a == acc and g == gen:
+                return sid, nm
+    return None
+
 
 class KokoroTTS:
     def __init__(
@@ -21,7 +48,7 @@ class KokoroTTS:
         *,
         num_threads: int = 2,
         speed: float = 1.0,
-        sid: int = 0,
+        voice: str = DEFAULT_VOICE,
     ):
         import sherpa_onnx
 
@@ -47,11 +74,20 @@ class KokoroTTS:
         )
         self._tts = sherpa_onnx.OfflineTts(config)
         self.speed = speed
-        self.sid = sid
+        self.voice_name = voice if voice in VOICES else DEFAULT_VOICE
+        self.sid = VOICES[self.voice_name][0]
 
     @property
     def sample_rate(self) -> int:
         return self._tts.sample_rate
+
+    def set_voice(self, *, name: str | None = None, accent: str | None = None, gender: str | None = None) -> str | None:
+        """Switch voice by name or (accent, gender). Returns the new voice name, or None."""
+        resolved = resolve_voice(name=name, accent=accent, gender=gender)
+        if resolved is None:
+            return None
+        self.sid, self.voice_name = resolved
+        return self.voice_name
 
     def synthesize(self, text: str, out_path: str | Path) -> tuple[str, float]:
         """Render ``text`` to a WAV file. Returns (path, duration_seconds)."""

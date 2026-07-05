@@ -83,9 +83,13 @@ class TransducerASR:
         import soundfile as sf
 
         samples, sr = sf.read(str(wav_path), dtype="float32")
-        if samples.ndim > 1:
+        if getattr(samples, "ndim", 1) > 1:
             samples = samples[:, 0]
+        return self.transcribe_samples(samples, sr)
+
+    def transcribe_samples(self, samples, sample_rate: int) -> str:
+        """Transcribe raw float32 mono samples (for live mic capture)."""
         stream = self._rec.create_stream()
-        stream.accept_waveform(sr, samples)
+        stream.accept_waveform(sample_rate, samples)
         self._rec.decode_stream(stream)
         return stream.result.text.strip()
