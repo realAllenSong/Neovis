@@ -1,7 +1,7 @@
 """Neovis — a small, elegant control window.
 
 Click Start; Neovis is then reachable two ways and nothing else:
-  • DM the Neovis bot in Slack (type or voice note), or
+  • DM the Neovis bot in Slack (from your phone), and
   • hold your push-to-talk key anywhere on the machine and speak.
 
 No terminal, no commands. The push-to-talk key and voice are set right here.
@@ -14,7 +14,7 @@ from __future__ import annotations
 import concurrent.futures
 import sys
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -32,12 +31,20 @@ from PySide6.QtWidgets import (
 from ..core.approval import ApprovalDecision, ApprovalGateway, ApprovalRequest
 from ..core.settings import load as load_settings
 from ..core.settings import save as save_settings
-from ..voice.tts import VOICES
 from .daemon import NeovisDaemon
+from .widgets import ChannelStatus, Collapsible, PrimaryButton
 
-# Friendly hotkey + voice labels
-_HOTKEYS = [("Right ⌘", "cmd_r"), ("Left ⌘", "cmd_l"), ("Right ⌥", "alt_r"),
-            ("Right ⌃", "ctrl_r"), ("F5", "f5")]
+# Friendly hotkey labels, per platform (pynput key names underneath).
+if sys.platform == "darwin":
+    _HOTKEYS = [("Right ⌘", "cmd_r"), ("Left ⌘", "cmd_l"), ("Right ⌥", "alt_r"),
+                ("Right ⌃", "ctrl_r"), ("F5", "f5")]
+elif sys.platform.startswith("win"):
+    _HOTKEYS = [("Right Ctrl", "ctrl_r"), ("Right Alt", "alt_r"),
+                ("Right Shift", "shift_r"), ("F5", "f5")]
+else:  # Linux
+    _HOTKEYS = [("Right Ctrl", "ctrl_r"), ("Right Alt", "alt_r"),
+                ("Right Shift", "shift_r"), ("Super", "cmd"), ("F5", "f5")]
+
 _VOICES = [("Sky · US ♀", "sky"), ("Adam · US ♂", "adam"),
            ("Emma · UK ♀", "emma"), ("George · UK ♂", "george")]
 
@@ -48,6 +55,7 @@ QLabel#title { font-size: 26px; font-weight: 600; }
 QLabel#subtitle { color: #8A8D96; font-size: 13px; }
 QLabel#section { color: #8A8D96; font-size: 11px; letter-spacing: 1px; }
 QLabel#hint { color: #6E727C; font-size: 12px; }
+QLabel#dotmsg { color: #9AA0AA; font-size: 12px; }
 QFrame#divider { background: #2A2C33; max-height: 1px; }
 QComboBox, QLineEdit { background: #23252B; border: 1px solid #33363E; border-radius: 8px;
     padding: 7px 10px; font-size: 13px; }
@@ -55,12 +63,7 @@ QComboBox:hover, QLineEdit:focus { border-color: #4C6EF5; }
 QComboBox:disabled, QLineEdit:disabled { color: #55585F; background: #1B1C21; border-color: #26282E; }
 QCheckBox { font-size: 13px; }
 QCheckBox:disabled, QLabel:disabled { color: #55585F; }
-QPushButton#primary { border: none; border-radius: 12px; padding: 14px; font-size: 15px;
-    font-weight: 600; background: #3B8A4E; color: white; }
-QPushButton#primary[running="true"] { background: #B5423A; }
-QPushButton#primary:hover { background: #46A05C; }
-QPushButton#primary[running="true"]:hover { background: #C64C43; }
-QLabel#dot { font-size: 13px; }
+QToolTip { background: #23252B; color: #E8E8EA; border: 1px solid #33363E; padding: 4px; }
 """
 
 
@@ -117,67 +120,82 @@ class NeovisWindow(QWidget):
         sub.setObjectName("subtitle")
         root.addWidget(sub)
 
-        # status dots
-        self.dot_slack = QLabel()
-        self.dot_voice = QLabel()
+        # live channel status
+        self.st_slack = ChannelStatus("Slack")
+        self.st_voice = ChannelStatus("Voice")
         status_row = QHBoxLayout()
         status_row.setSpacing(18)
-        status_row.addWidget(self.dot_slack)
-        status_row.addWidget(self.dot_voice)
+        status_row.addWidget(self.st_slack)
+        status_row.addWidget(self.st_voice)
         status_row.addStretch()
-        root.addSpacing(4)
+        root.addSpacing(2)
         root.addLayout(status_row)
 
-        # primary button
-        self.btn = QPushButton("Start")
-        self.btn.setObjectName("primary")
-        self.btn.setCursor(Qt.PointingHandCursor)
+        # the one button
+        self.btn = PrimaryButton("Start")
+        self.btn.setToolTip("Bring Neovis up (Slack + voice). Click again to stop everything.")
         self.btn.clicked.connect(self._toggle)
-        root.addSpacing(6)
+        root.addSpacing(4)
         root.addWidget(self.btn)
 
-        root.addWidget(self._divider())
-        root.addWidget(self._label("SETTINGS", "section"))
+        # settings (locked while running — stop to change)
+        self.box_settings = QWidget()
+        box = QVBoxLayout(self.box_settings)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(16)
+
+        box.addWidget(self._divider())
+        box.addWidget(self._label("SETTINGS", "section"))
 
         self.chk_voice = QCheckBox("Enable voice (hold a key to talk)")
         self.chk_voice.setChecked(bool(self.settings.get("voice_enabled", True)))
+        self.chk_voice.setToolTip("Run the local voice loop (microphone + speech).\nTurn off to use Slack only.")
         self.chk_voice.stateChanged.connect(self._on_voice_toggle)
-        root.addWidget(self.chk_voice)
+        box.addWidget(self.chk_voice)
 
-        # Voice settings live in one box so they dim together when voice is off.
-        self.voice_box = QWidget()
-        vbox = QVBoxLayout(self.voice_box)
+        voice_inner = QWidget()
+        vbox = QVBoxLayout(voice_inner)
         vbox.setContentsMargins(0, 0, 0, 0)
         vbox.setSpacing(16)
-        self.cb_key = self._combo(_HOTKEYS, self.settings.get("hotkey", "cmd_r"))
+        self.cb_key = self._combo(_HOTKEYS, self.settings.get("hotkey", _HOTKEYS[0][1]))
+        self.cb_key.setToolTip("The key you hold — anywhere, in any app — to talk to Neovis.")
         vbox.addLayout(self._field("Push-to-talk key", self.cb_key))
         self.cb_voice = self._combo(_VOICES, self.settings.get("voice", "sky"))
+        self.cb_voice.setToolTip("Neovis's speaking voice. You can also just ask it —\n“make it a British male voice”.")
         vbox.addLayout(self._field("Voice", self.cb_voice))
         self.chk_hf = QCheckBox("Hands-free (talk anytime, barge-in)")
         self.chk_hf.setChecked(bool(self.settings.get("hands_free")))
+        self.chk_hf.setToolTip("No key needed — Neovis listens continuously and you can\ninterrupt it while it speaks. Headphones recommended.")
         self.chk_hf.stateChanged.connect(self._save)
         vbox.addWidget(self.chk_hf)
-        root.addWidget(self.voice_box)
-        self._sync_voice_controls()
 
-        root.addWidget(self._divider())
-        root.addWidget(self._label("SLACK (optional — for phone control)", "section"))
+        self.fold = Collapsible(voice_inner)
+        self.fold.resized.connect(self.adjustSize)
+        box.addWidget(self.fold)
+
+        box.addWidget(self._divider())
+        box.addWidget(self._label("SLACK (optional — control from your phone)", "section"))
         self.ed_bot = self._secret("Bot token  xoxb-…", self.settings.get("slack_bot_token", ""))
+        self.ed_bot.setToolTip("api.slack.com → your app → OAuth & Permissions → Bot User OAuth Token")
         self.ed_app = self._secret("App token  xapp-…", self.settings.get("slack_app_token", ""))
-        root.addWidget(self.ed_bot)
-        root.addWidget(self.ed_app)
+        self.ed_app.setToolTip("api.slack.com → your app → Basic Information → App-Level Tokens (connections:write)")
+        box.addWidget(self.ed_bot)
+        box.addWidget(self.ed_app)
+        root.addWidget(self.box_settings)
 
-        hint = QLabel("Hold your key anywhere and talk · or DM the Neovis bot in Slack.")
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        root.addSpacing(6)
-        root.addWidget(hint)
+        # dynamic hint — tells you exactly what to do in the current state
+        self.hint = QLabel("")
+        self.hint.setObjectName("hint")
+        self.hint.setWordWrap(True)
+        root.addSpacing(4)
+        root.addWidget(self.hint)
 
         for w in (self.cb_key, self.cb_voice):
             w.currentIndexChanged.connect(self._save)
         for w in (self.ed_bot, self.ed_app):
             w.editingFinished.connect(self._save)
 
+        self.fold.set_open(self.chk_voice.isChecked(), animate=False)
         self._render_status(self.daemon.status)
 
     def _divider(self) -> QFrame:
@@ -195,8 +213,8 @@ class NeovisWindow(QWidget):
         box = QComboBox()
         for label, value in pairs:
             box.addItem(label, value)
-        idx = max(0, [v for _, v in pairs].index(current) if current in [v for _, v in pairs] else 0)
-        box.setCurrentIndex(idx)
+        values = [v for _, v in pairs]
+        box.setCurrentIndex(values.index(current) if current in values else 0)
         return box
 
     def _field(self, label: str, widget: QWidget) -> QHBoxLayout:
@@ -226,17 +244,14 @@ class NeovisWindow(QWidget):
             "slack_app_token": self.ed_app.text().strip(),
         }
 
-    def _sync_voice_controls(self) -> None:
-        """Grey out the voice settings when voice is switched off."""
-        self.voice_box.setEnabled(self.chk_voice.isChecked())
-
     def _on_voice_toggle(self, *_) -> None:
-        self._sync_voice_controls()
+        self.fold.set_open(self.chk_voice.isChecked())
         self._save()
 
     def _save(self, *_) -> None:
         self.settings = self._current_settings()
         save_settings(self.settings)
+        self._render_status(self.daemon.status)  # keep the hint line in sync
 
     def _toggle(self) -> None:
         if self.daemon.is_running():
@@ -245,23 +260,41 @@ class NeovisWindow(QWidget):
             self._save()
             self.daemon.start(self.settings)
 
-    _DOTS = {"on": "🟢", "starting": "🟡", "error": "🔴", "off": "⚪"}
+    @staticmethod
+    def _norm(state) -> str:
+        if isinstance(state, bool):  # tolerate the old bool shape
+            return "on" if state else "off"
+        return state if state in ("on", "starting", "error", "off") else "off"
 
     def _render_status(self, status: dict) -> None:
-        running = status.get("running")
-        self.btn.setText("Stop" if running else "Start")
-        self.btn.setProperty("running", "true" if running else "false")
-        self.btn.style().unpolish(self.btn)
-        self.btn.style().polish(self.btn)
-        self.dot_slack.setText(self._dot_text("Slack", status.get("slack"), status.get("slack_msg")))
-        self.dot_voice.setText(self._dot_text("Voice", status.get("voice"), status.get("voice_msg")))
-        self.dot_slack.setObjectName("dot")
-        self.dot_voice.setObjectName("dot")
+        running = bool(status.get("running"))
+        slack = self._norm(status.get("slack"))
+        voice = self._norm(status.get("voice"))
+        self.btn.set_running(running)
+        self.box_settings.setEnabled(not running)  # stop to change settings
+        self.st_slack.set_state(slack, status.get("slack_msg", ""))
+        self.st_voice.set_state(voice, status.get("voice_msg", ""))
+        self.hint.setText(self._hint_text(running, slack, voice))
 
-    def _dot_text(self, name: str, state, msg) -> str:
-        dot = self._DOTS.get(state if isinstance(state, str) else ("on" if state else "off"), "⚪")
-        label = name if not msg else f"{name} · {str(msg)[:34]}"
-        return f"{dot}  {label}"
+    def _hint_text(self, running: bool, slack: str, voice: str) -> str:
+        key = self.cb_key.currentText()
+        if not running:
+            ways = []
+            if self.ed_bot.text().strip():
+                ways.append("DM the Neovis bot in Slack")
+            if self.chk_voice.isChecked():
+                ways.append(f"hold {key} anywhere and talk")
+            return "Click Start — then " + " · or ".join(ways or ["add your Slack tokens below"]) + "."
+        ways = []
+        if slack == "on":
+            ways.append("DM the Neovis bot in Slack")
+        if voice == "on":
+            ways.append(f"hold {key} anywhere and talk")
+        if ways:
+            return "Ready — " + " · or ".join(ways) + ".  (Stop to change settings.)"
+        if "starting" in (slack, voice):
+            return "Warming up…"
+        return "Nothing is running — check the status above, then Stop and try again."
 
     def _on_approval_request(self, req: ApprovalRequest, fut: concurrent.futures.Future) -> None:
         box = QMessageBox(self)
