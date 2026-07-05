@@ -25,10 +25,10 @@ from pathlib import Path
 from ...core.approval import ConsoleApproval
 from ...core.audit import AuditLog
 from ...core.config import AppConfig, ModelConfig, load_config
+from ...core.router import IntentRouter
 from ...core.session import NeovisSession
 from ...voice.asr import TransducerASR
-from ...voice.commands import parse_voice_command
-from ...voice.tts import VOICES, KokoroTTS, resolve_voice
+from ...voice.tts import VOICES, KokoroTTS
 
 
 def _play(wav: str) -> None:
@@ -61,10 +61,11 @@ def _for_speech(text: str, limit: int = 600) -> str:
 
 
 class VoiceLoop:
-    def __init__(self, session: NeovisSession, asr: TransducerASR, tts: KokoroTTS):
+    def __init__(self, session: NeovisSession, asr: TransducerASR, tts: KokoroTTS, router=None):
         self.session = session
         self.asr = asr
         self.tts = tts
+        self.router = router  # IntentRouter (Haiku) or None → rule fallback
         self._wav = Path(tempfile.gettempdir()) / "neovis_say.wav"
 
     def speak(self, text: str) -> None:
@@ -72,37 +73,44 @@ class VoiceLoop:
         _play(str(self._wav))
 
     async def handle_utterance(self, text: str) -> str:
-        # 1) Voice command Neovis handles itself (easter egg: accent/gender).
-        intent = parse_voice_command(text)
-        if intent is not None:
-            return self._switch_voice(intent)
-        # 2) Otherwise it's a task for the gated agent.
+        # The fast model (Haiku) decides what this means; the big model executes.
+        if self.router is not None:
+            intent = await self.router.classify(text)
+        else:
+            from ...core.router import rule_fallback
+
+            intent = rule_fallback(text)
+        action = intent.get("action", "task")
+
+        if action == "stop":
+            self.session.stop()
+            self.speak("Stopping.")
+            return "(stopped)"
+        if action == "voice":
+            return self._switch_voice(intent.get("name"), intent.get("accent"), intent.get("gender"))
+        # task → the gated agent
         reply = await self.session.send(text)
         self.speak(_for_speech(reply))
         return reply
 
-    def _switch_voice(self, intent) -> str:
-        """Smart voice switch: fill missing dimension from the current voice and
-        announce the result; if nothing was specified, ask which voice."""
+    def _switch_voice(self, name: str | None, accent: str | None, gender: str | None) -> str:
+        """Fill the missing dimension from the current voice and announce; if
+        nothing usable was given, ask which voice."""
         _, cur_accent, cur_gender = (self.tts.voice_name,) + VOICES[self.tts.voice_name][1:]
 
-        if intent.name:
-            self.tts.set_voice(name=intent.name)
+        if name:
+            self.tts.set_voice(name=name)
             return self._announce_voice(inferred=False)
 
-        if not intent.accent and not intent.gender:
-            # A change was asked for, but underspecified — offer the options.
+        if not accent and not gender:
             self.speak(
                 "Sure. I can do American or British, male or female. "
                 f"You're on {cur_accent} {cur_gender} now. Which would you like?"
             )
             return "(asked which voice)"
 
-        # Fill the unspecified dimension from the current voice, then switch.
-        accent = intent.accent or cur_accent
-        gender = intent.gender or cur_gender
-        self.tts.set_voice(accent=accent, gender=gender)
-        return self._announce_voice(inferred=not (intent.accent and intent.gender))
+        self.tts.set_voice(accent=accent or cur_accent, gender=gender or cur_gender)
+        return self._announce_voice(inferred=not (accent and gender))
 
     def _announce_voice(self, *, inferred: bool) -> str:
         _, accent, gender = (self.tts.voice_name,) + VOICES[self.tts.voice_name][1:]
@@ -195,13 +203,20 @@ async def _run(args) -> int:
     await session.connect()
     asr = TransducerASR(hotwords=args.hotword or None)
     tts = KokoroTTS(voice=args.voice)
-    loop = VoiceLoop(session, asr, tts)
+    router = IntentRouter()
+    await router.connect()
+    if router.available:
+        print("Intent router: Haiku (fast tier)")
+    else:
+        print("Intent router: rule-based fallback (no model reachable)")
+    loop = VoiceLoop(session, asr, tts, router=router)
     try:
         if args.type:
             await loop.run_typed()
         else:
             await loop.run_push_to_talk(key_name=args.key)
     finally:
+        await router.disconnect()
         await session.disconnect()
     return 0
 
