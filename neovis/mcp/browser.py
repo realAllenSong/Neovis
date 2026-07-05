@@ -29,17 +29,23 @@ _PKG = "chrome-devtools-mcp@latest"
 # security, so a dedicated profile is both required and safer (Neovis only sees
 # what you log into here, not your whole main browser).
 NEOVIS_CHROME_PROFILE = Path.home() / ".neovis" / "chrome-profile"
-_MAC_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+# Fixed install locations by OS; PATH lookups cover the rest.
+_CHROME_PATHS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",  # macOS
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",         # Windows
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+]
 
 
 def _chrome_binary() -> str | None:
-    for candidate in (
-        _MAC_CHROME,
-        shutil.which("google-chrome"),
-        shutil.which("google-chrome-stable"),
-        shutil.which("chromium"),
-        shutil.which("chrome"),
-    ):
+    candidates = list(_CHROME_PATHS) + [
+        shutil.which(n) for n in
+        ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome")
+    ]
+    for candidate in candidates:
         if candidate and Path(candidate).exists():
             return candidate
     return None

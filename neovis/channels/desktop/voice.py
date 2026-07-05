@@ -33,15 +33,25 @@ from ...voice.tts import VOICES, KokoroTTS, resolve_voice
 
 def _play(wav: str) -> None:
     if sys.platform == "darwin":
-        cmd = ["afplay", wav]
-    elif shutil.which("aplay"):
-        cmd = ["aplay", "-q", wav]
-    elif shutil.which("ffplay"):
-        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", wav]
-    else:
-        print("(no audio player found — install ffmpeg or aplay)")
+        subprocess.run(["afplay", wav])
         return
-    subprocess.run(cmd)
+    if sys.platform.startswith("win"):
+        try:
+            import winsound
+
+            winsound.PlaySound(wav, winsound.SND_FILENAME)
+            return
+        except Exception:
+            pass
+    for player in (
+        ["aplay", "-q", wav],
+        ["paplay", wav],
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", wav],
+    ):
+        if shutil.which(player[0]):
+            subprocess.run(player)
+            return
+    print("(no audio player found — install ffmpeg, alsa-utils, or pulseaudio)")
 
 
 def _for_speech(text: str, limit: int = 600) -> str:

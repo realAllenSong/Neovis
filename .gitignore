@@ -1,6 +1,7 @@
 # Secrets
 .env
 dev/gateway.env
+dev/slack.env
 
 # Neovis runtime
 *.db
