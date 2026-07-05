@@ -6,13 +6,31 @@ Work top to bottom. Each card: **what to run → what to do → what you should 
 
 ```bash
 cd ~/Desktop/Neovis
-uv sync --extra dev --extra slack --extra voice --extra desktop
+uv sync --extra dev --extra slack --extra voice --extra desktop --extra app
 ```
 
 - **Model auth:** uses your logged-in Claude Code (Pro/Max subscription → no extra API spend). Nothing to set.
 - **Voice models** (for the voice tests) into `~/.neovis/models/`:
-  - Kokoro TTS: `kokoro-en-v0_19` · ASR: `sherpa-onnx-zipformer-en-2023-04-01` (has `bpe.model` for hotwords) · VAD: `silero_vad.onnx`.
+  - Kokoro TTS: `kokoro-en-v0_19` · ASR: `sherpa-onnx-zipformer-en-2023-04-01` (has `bpe.model` for hotwords) · VAD: `ten-vad.onnx` (falls back to `silero_vad.onnx`).
 - **macOS permissions** (for push-to-talk / hands-free): System Settings → Privacy & Security → **Accessibility** (your terminal) and **Microphone**.
+
+---
+
+## The app — start here (the one thing you run)
+
+```bash
+uv run neovis-app        # or: ./scripts/make_app.sh && open Neovis.app
+```
+
+Click **Start**. One process brings up **both** channels: the Slack bot (phone) and
+the push-to-talk voice loop (desk). The dots tell the story — amber breathing =
+warming up, green glow = live, red = failed with the reason next to it (e.g.
+`Voice · no microphone found`); one channel failing never blocks the other.
+Settings (hotkey, voice, hands-free, tokens) live in the window and lock while
+running — **Stop** to change them. Untick **Enable voice** to run Slack-only.
+
+Everything below can be exercised through the app; the per-feature terminal
+commands are for isolating one piece at a time.
 
 ---
 
@@ -79,7 +97,9 @@ DM the **neovis** bot in Slack:
 
 **Expect:** phone → agent → phone reply, with consequential actions gated by buttons on your phone.
 
-Run it yourself:
+The app's **Start** runs this for you (tokens from the window). Standalone, for
+isolation only — never at the same time as the app (two Socket Mode connections
+split events):
 ```bash
 SLACK_BOT_TOKEN=xoxb-… SLACK_APP_TOKEN=xapp-… uv run python -m neovis.channels.slack.app
 ```
