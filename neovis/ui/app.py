@@ -223,18 +223,23 @@ class NeovisWindow(QWidget):
             self._save()
             self.daemon.start(self.settings)
 
+    _DOTS = {"on": "🟢", "starting": "🟡", "error": "🔴", "off": "⚪"}
+
     def _render_status(self, status: dict) -> None:
         running = status.get("running")
         self.btn.setText("Stop" if running else "Start")
         self.btn.setProperty("running", "true" if running else "false")
         self.btn.style().unpolish(self.btn)
         self.btn.style().polish(self.btn)
-        self.dot_slack.setText(("🟢" if status.get("slack") else "⚪") + "  Slack")
-        self.dot_voice.setText(("🟢" if status.get("voice") else "⚪") + "  Voice")
+        self.dot_slack.setText(self._dot_text("Slack", status.get("slack"), status.get("slack_msg")))
+        self.dot_voice.setText(self._dot_text("Voice", status.get("voice"), status.get("voice_msg")))
         self.dot_slack.setObjectName("dot")
         self.dot_voice.setObjectName("dot")
-        if status.get("error"):
-            self.dot_voice.setText("🔴  " + status["error"][:40])
+
+    def _dot_text(self, name: str, state, msg) -> str:
+        dot = self._DOTS.get(state if isinstance(state, str) else ("on" if state else "off"), "⚪")
+        label = name if not msg else f"{name} · {str(msg)[:34]}"
+        return f"{dot}  {label}"
 
     def _on_approval_request(self, req: ApprovalRequest, fut: concurrent.futures.Future) -> None:
         box = QMessageBox(self)
