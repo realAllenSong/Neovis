@@ -21,6 +21,7 @@ import asyncio
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import uuid4
 
 from ...core.approval import ApprovalDecision, ApprovalGateway, ApprovalRequest
@@ -104,6 +105,88 @@ async def _get_session(config: AppConfig, audit: AuditLog, user: str, channel: s
     return session
 
 
+# ── voice notes (Slack audio clips → local ASR) ───────────────────────────────
+_AUDIO_TYPES = ("m4a", "mp3", "mp4", "wav", "webm", "ogg", "flac", "aac", "amr")
+_ASR = None
+_ASR_LOCK: asyncio.Lock | None = None
+
+
+def _audio_files(event: dict) -> list[dict]:
+    """Audio attachments on a message (Slack voice memos are audio/mp4 m4a)."""
+    out = []
+    for f in event.get("files") or []:
+        if (f.get("mimetype", "").startswith("audio/")
+                or f.get("filetype", "").lower() in _AUDIO_TYPES):
+            out.append(f)
+    return out
+
+
+def _to_wav16k(src: "Path") -> "Path":
+    """Any audio container → 16 kHz mono wav for the ASR (ffmpeg, or afconvert
+    on macOS)."""
+    import shutil
+    import subprocess
+    import sys
+
+    out = src.parent / (src.stem + "_16k.wav")
+    if shutil.which("ffmpeg"):
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src), "-ar", "16000", "-ac", "1",
+             "-loglevel", "error", str(out)],
+            check=True,
+        )
+    elif sys.platform == "darwin" and shutil.which("afconvert"):
+        subprocess.run(
+            ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(src), str(out)],
+            check=True,
+        )
+    else:
+        raise RuntimeError("install ffmpeg to transcribe voice notes")
+    return out
+
+
+async def _get_asr():
+    """Load the local ASR once, lazily (Parakeet-TDT via sherpa-onnx)."""
+    global _ASR, _ASR_LOCK
+    if _ASR_LOCK is None:
+        _ASR_LOCK = asyncio.Lock()
+    async with _ASR_LOCK:
+        if _ASR is None:
+            from ...voice.asr import TransducerASR
+
+            _ASR = await asyncio.to_thread(TransducerASR)
+    return _ASR
+
+
+async def _transcribe_slack_audio(f: dict, client) -> str:
+    """Download a Slack audio file with the bot token and transcribe locally."""
+    import tempfile
+
+    import aiohttp
+
+    url = f.get("url_private_download") or f.get("url_private")
+    if not url:
+        raise RuntimeError("no downloadable URL on the file")
+    suffix = os.path.splitext(f.get("name") or "")[1] or ".m4a"
+    raw = Path(tempfile.gettempdir()) / f"neovis_note_{uuid4().hex}{suffix}"
+    async with aiohttp.ClientSession() as http:
+        async with http.get(url, headers={"Authorization": f"Bearer {client.token}"}) as r:
+            body = await r.read()
+            ctype = r.headers.get("content-type", "")
+            if r.status != 200 or "text/html" in ctype:
+                raise RuntimeError(
+                    "couldn't download the audio — add the *files:read* scope "
+                    "(OAuth & Permissions) and reinstall the app"
+                )
+    raw.write_bytes(body)
+    try:
+        wav = await asyncio.to_thread(_to_wav16k, raw)
+        asr = await _get_asr()
+        return (await asyncio.to_thread(asr.transcribe, wav)).strip()
+    finally:
+        raw.unlink(missing_ok=True)
+
+
 def _artifact_paths(text: str) -> list[str]:
     """Existing file paths mentioned in a tool result (screenshots, zips)."""
     seen: list[str] = []
@@ -132,13 +215,15 @@ def build_slack_app():
 
     @app.event("message")
     async def on_message(event, client, say):  # noqa: ANN001
-        if event.get("bot_id") or event.get("subtype"):
+        # Accept plain messages AND file_share (voice memos / audio clips).
+        if event.get("bot_id") or event.get("subtype") not in (None, "file_share"):
             return
         user = event.get("user")
         channel = event.get("channel")
         text = (event.get("text") or "").strip()
         msg_ts = event.get("ts")
-        if not user or not text:
+        audio = _audio_files(event)
+        if not user or (not text and not audio):
             return
 
         if text.lower() in ("stop", "/stop"):
@@ -152,6 +237,25 @@ def build_slack_app():
             await client.reactions_add(channel=channel, timestamp=msg_ts, name="eyes")
         except Exception:
             pass
+
+        if audio and not text:
+            # Voice note → transcribe locally first, and show what was heard.
+            heard = await client.chat_postMessage(
+                channel=channel, text="🎧  _listening to your voice note…_"
+            )
+            try:
+                text = await _transcribe_slack_audio(audio[0], client)
+            except Exception as exc:
+                await client.chat_update(channel=channel, ts=heard["ts"],
+                                         text=f"⚠️ {exc}")
+                return
+            if not text:
+                await client.chat_update(channel=channel, ts=heard["ts"],
+                                         text="🎧 I couldn't hear anything in that note.")
+                return
+            await client.chat_update(channel=channel, ts=heard["ts"],
+                                     text=f"🎤  _Heard:_ “{text}”")
+
         status = await client.chat_postMessage(channel=channel, text="🤔  _Neovis is on it…_")
         status_ts = status["ts"]
 

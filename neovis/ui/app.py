@@ -32,6 +32,7 @@ from ..core.approval import ApprovalDecision, ApprovalGateway, ApprovalRequest
 from ..core.settings import load as load_settings
 from ..core.settings import save as save_settings
 from .daemon import NeovisDaemon
+from .overlay import GuiVoiceUI, NeovisOverlay, OverlayBridge
 from .widgets import ChannelStatus, Collapsible, PrimaryButton
 
 # Friendly hotkey labels, per platform (pynput key names underneath).
@@ -95,9 +96,21 @@ class NeovisWindow(QWidget):
         self.settings = load_settings()
         self._bridge = _ApprovalBridge()
         self._bridge.request.connect(self._on_approval_request)
+        # Siri-style capsule: daemon-thread voice events → queued signals → overlay
+        self.overlay = NeovisOverlay()
+        self._voice_bridge = OverlayBridge()
+        b, o = self._voice_bridge, self.overlay
+        b.listening.connect(o.show_listening)
+        b.level.connect(o.set_level)
+        b.thinking.connect(o.show_thinking)
+        b.step.connect(o.set_step)
+        b.response.connect(o.show_response)
+        b.error.connect(o.show_error)
+        b.idle.connect(o.hide_overlay)
         self.daemon = NeovisDaemon(
             on_status=lambda s: self._status_changed.emit(s),
             approval_factory=lambda: GuiApproval(self._bridge),
+            voice_ui_factory=lambda: GuiVoiceUI(self._voice_bridge),
         )
         self._status_changed.connect(self._render_status)
         self._build()
@@ -163,11 +176,16 @@ class NeovisWindow(QWidget):
         self.cb_voice = self._combo(_VOICES, self.settings.get("voice", "sky"))
         self.cb_voice.setToolTip("Neovis's speaking voice. You can also just ask it —\n“make it a British male voice”.")
         vbox.addLayout(self._field("Voice", self.cb_voice))
-        self.chk_hf = QCheckBox("Hands-free (talk anytime, barge-in)")
+        self.chk_hf = QCheckBox("Hands-free (talk anytime, no key)")
         self.chk_hf.setChecked(bool(self.settings.get("hands_free")))
-        self.chk_hf.setToolTip("No key needed — Neovis listens continuously and you can\ninterrupt it while it speaks. Headphones recommended.")
+        self.chk_hf.setToolTip("No key needed — Neovis listens continuously and answers when\nyou pause. The mic mutes while Neovis speaks (no echo).")
         self.chk_hf.stateChanged.connect(self._save)
         vbox.addWidget(self.chk_hf)
+        self.chk_bi = QCheckBox("Barge-in (interrupt it by talking — headphones!)")
+        self.chk_bi.setChecked(bool(self.settings.get("barge_in")))
+        self.chk_bi.setToolTip("Keep listening WHILE Neovis speaks so you can cut it off.\nOnly with headphones — on open speakers it hears itself.")
+        self.chk_bi.stateChanged.connect(self._save)
+        vbox.addWidget(self.chk_bi)
 
         self.fold = Collapsible(voice_inner)
         self.fold.resized.connect(self.adjustSize)
@@ -239,6 +257,7 @@ class NeovisWindow(QWidget):
             "hotkey": self.cb_key.currentData(),
             "voice": self.cb_voice.currentData(),
             "hands_free": self.chk_hf.isChecked(),
+            "barge_in": self.chk_bi.isChecked(),
             "hotwords": self.settings.get("hotwords", []),
             "slack_bot_token": self.ed_bot.text().strip(),
             "slack_app_token": self.ed_app.text().strip(),

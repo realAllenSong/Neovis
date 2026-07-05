@@ -18,7 +18,8 @@ DEFAULTS: dict[str, Any] = {
     "voice_enabled": True,         # run the desktop push-to-talk voice loop
     "hotkey": "cmd_r",             # push-to-talk key
     "voice": "sky",                # sky / adam / emma / george
-    "hands_free": False,           # continuous VAD + barge-in instead of hold-to-talk
+    "hands_free": False,           # continuous VAD listening instead of hold-to-talk
+    "barge_in": False,             # interrupt Neovis by talking (headphones only)
     "hotwords": [],                # ASR contextual-bias words
     "slack_bot_token": "",         # xoxb-…
     "slack_app_token": "",         # xapp-…

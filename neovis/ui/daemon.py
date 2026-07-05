@@ -37,9 +37,10 @@ def _friendly(exc: Exception) -> str:
 
 
 class NeovisDaemon:
-    def __init__(self, on_status=None, approval_factory=None):
+    def __init__(self, on_status=None, approval_factory=None, voice_ui_factory=None):
         self._on_status = on_status              # callable(dict)
         self._approval_factory = approval_factory  # () -> ApprovalGateway for voice
+        self._voice_ui_factory = voice_ui_factory  # () -> VoiceUI (the overlay bridge)
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop: asyncio.Future | None = None
@@ -137,10 +138,12 @@ class NeovisDaemon:
             from ..channels.desktop.voice import build_voice_loop
 
             approval = self._approval_factory() if self._approval_factory else None
+            ui = self._voice_ui_factory() if self._voice_ui_factory else None
             loop, cleanup, _ = await build_voice_loop(
                 voice=settings.get("voice", "sky"),
                 hotwords=settings.get("hotwords") or None,
                 approval=approval,
+                ui=ui,
             )
         except asyncio.CancelledError:
             raise
@@ -150,7 +153,7 @@ class NeovisDaemon:
         self._set(voice="on", voice_msg="")
         try:
             if settings.get("hands_free"):
-                await loop.run_hands_free()
+                await loop.run_hands_free(barge_in=bool(settings.get("barge_in")))
             else:
                 await loop.run_push_to_talk(key_name=settings.get("hotkey", "cmd_r"))
         except asyncio.CancelledError:

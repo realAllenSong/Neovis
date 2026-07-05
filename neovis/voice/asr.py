@@ -14,8 +14,12 @@ from pathlib import Path
 
 from . import MODELS_DIR
 
-# The 2023-04-01 model ships bpe.model, so hotwords (contextual biasing) work.
-DEFAULT_ASR_DIR = MODELS_DIR / "sherpa-onnx-zipformer-en-2023-04-01"
+# Preferred: NVIDIA Parakeet-TDT-0.6b-v2 int8 (top English accuracy, cased +
+# punctuated, CPU real-time via sherpa-onnx). Fallback: the small zipformer,
+# which ships bpe.model so hotwords (contextual biasing) work.
+PARAKEET_DIR = MODELS_DIR / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
+ZIPFORMER_DIR = MODELS_DIR / "sherpa-onnx-zipformer-en-2023-04-01"
+DEFAULT_ASR_DIR = PARAKEET_DIR if PARAKEET_DIR.exists() else ZIPFORMER_DIR
 
 
 def _export_bpe_vocab(model_path: Path, out_path: Path) -> None:
@@ -44,9 +48,10 @@ class TransducerASR:
         suffix = ".int8" if int8 else ""
 
         def one(prefix: str) -> str:
-            hits = sorted(d.glob(f"{prefix}-*{suffix}.onnx"))
+            # zipformer names: encoder-epoch-…​.int8.onnx; parakeet: encoder.int8.onnx
+            hits = sorted(d.glob(f"{prefix}*{suffix}.onnx"))
             if not hits:
-                hits = sorted(d.glob(f"{prefix}-*.onnx"))
+                hits = sorted(d.glob(f"{prefix}*.onnx"))
             if not hits:
                 raise FileNotFoundError(f"no {prefix} onnx in {d}")
             return str(hits[0])
@@ -59,6 +64,8 @@ class TransducerASR:
             num_threads=num_threads,
             decoding_method="greedy_search",
         )
+        if "nemo" in d.name or "parakeet" in d.name:
+            kwargs["model_type"] = "nemo_transducer"
 
         bpe_model = d / "bpe.model"
         self.hotwords_active = False
