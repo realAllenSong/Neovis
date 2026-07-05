@@ -87,6 +87,27 @@ uv run neovis --auto-approve   # skip prompts (demos only)
 
 Try: `what's in my Downloads folder?` · `take a screenshot` · `show CPU & memory`.
 
+## Desktop app (no terminal)
+
+A small control window ties it together — one **Start** button, a push-to-talk
+key + voice picker, and (optional) Slack tokens. Once started, Neovis is
+reachable exactly two ways and nothing else: **DM the Slack bot** from your
+phone, or **hold your push-to-talk key** anywhere and speak.
+
+```bash
+uv sync --extra app --extra slack --extra voice --extra desktop
+uv run neovis-app             # the control window
+
+./scripts/make_app.sh         # or: build a double-click Neovis.app…
+open Neovis.app               # …and launch it with no terminal at all
+```
+
+The window shows each channel's live state — `🟡 starting…`, `🟢 on`, or
+`🔴` with the reason (e.g. `Voice · no microphone found`, `Claude sign-in
+needed`) — and a channel that can't come up never blocks the other. Settings
+persist to `~/.neovis/settings.yaml`; first launch will ask macOS for
+**Microphone** and **Accessibility** (global hotkey) permission.
+
 ## Configure the model
 
 The agent core is model-agnostic. Point [`neovis/config/models.yaml`](neovis/config/models.yaml)

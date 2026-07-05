@@ -17,6 +17,9 @@ venv/
 build/
 dist/
 
+# generated launcher bundle (rebuild with scripts/make_app.sh; bakes a local path)
+Neovis.app/
+
 # uv
 .uv/
 
