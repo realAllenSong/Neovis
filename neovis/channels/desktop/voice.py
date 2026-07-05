@@ -28,7 +28,7 @@ from ...core.config import AppConfig, ModelConfig, load_config
 from ...core.session import NeovisSession
 from ...voice.asr import TransducerASR
 from ...voice.commands import parse_voice_command
-from ...voice.tts import VOICES, KokoroTTS
+from ...voice.tts import VOICES, KokoroTTS, resolve_voice
 
 
 def _play(wav: str) -> None:
@@ -63,17 +63,44 @@ class VoiceLoop:
 
     async def handle_utterance(self, text: str) -> str:
         # 1) Voice command Neovis handles itself (easter egg: accent/gender).
-        vc = parse_voice_command(text)
-        if vc is not None:
-            _, name = vc
-            self.tts.set_voice(name=name)
-            _, accent, gender = (name,) + VOICES[name][1:]
-            self.speak(f"Okay, switching to a {accent} {gender} voice.")
-            return f"(voice → {name})"
+        intent = parse_voice_command(text)
+        if intent is not None:
+            return self._switch_voice(intent)
         # 2) Otherwise it's a task for the gated agent.
         reply = await self.session.send(text)
         self.speak(_for_speech(reply))
         return reply
+
+    def _switch_voice(self, intent) -> str:
+        """Smart voice switch: fill missing dimension from the current voice and
+        announce the result; if nothing was specified, ask which voice."""
+        _, cur_accent, cur_gender = (self.tts.voice_name,) + VOICES[self.tts.voice_name][1:]
+
+        if intent.name:
+            self.tts.set_voice(name=intent.name)
+            return self._announce_voice(inferred=False)
+
+        if not intent.accent and not intent.gender:
+            # A change was asked for, but underspecified — offer the options.
+            self.speak(
+                "Sure. I can do American or British, male or female. "
+                f"You're on {cur_accent} {cur_gender} now. Which would you like?"
+            )
+            return "(asked which voice)"
+
+        # Fill the unspecified dimension from the current voice, then switch.
+        accent = intent.accent or cur_accent
+        gender = intent.gender or cur_gender
+        self.tts.set_voice(accent=accent, gender=gender)
+        return self._announce_voice(inferred=not (intent.accent and intent.gender))
+
+    def _announce_voice(self, *, inferred: bool) -> str:
+        _, accent, gender = (self.tts.voice_name,) + VOICES[self.tts.voice_name][1:]
+        msg = f"Okay — {accent} {gender} voice now."
+        if inferred:
+            msg += " Say American or British, or male or female, to change it."
+        self.speak(msg)
+        return f"(voice → {self.tts.voice_name})"
 
     # ── input modes ──────────────────────────────────────────────────────────
     async def run_typed(self) -> None:
