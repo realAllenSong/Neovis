@@ -5,10 +5,14 @@ so it works from behind a corporate firewall. This is the phone entry point;
 the desktop entry point (hotkey/voice) reuses the same agent core.
 
 Run:  python -m neovis.channels.slack.app
-Env:  SLACK_BOT_TOKEN (xoxb-…), SLACK_APP_TOKEN (xapp-…), NEOVIS_API_KEY
+Env:  SLACK_BOT_TOKEN (xoxb-…), SLACK_APP_TOKEN (xapp-…). Model auth is the
+      session's concern (subscription Claude / proxy / gateway).
 
-The interactive approval card lives in :mod:`.blocks`; :class:`SlackApproval`
-bridges those buttons to the model-agnostic approval gateway used everywhere.
+Each Slack user gets a NeovisSession (Claude Agent SDK) whose tool use is
+consequence-gated exactly like the desktop REPL. The interactive approval card
+lives in :mod:`.blocks`; :class:`SlackApproval` bridges those buttons to the
+approval gateway the gate awaits — so an OUTWARD action pauses on the user's
+phone with Approve / Deny.
 """
 
 from __future__ import annotations
@@ -19,11 +23,10 @@ import re
 from dataclasses import dataclass
 from uuid import uuid4
 
-from ...core.agent import Session, build_agent
 from ...core.approval import ApprovalDecision, ApprovalGateway, ApprovalRequest
 from ...core.audit import AuditLog
 from ...core.config import AppConfig, load_config
-from ...core.deps import NeovisDeps
+from ...core.session import NeovisSession
 from .blocks import approval_blocks, decided_blocks
 
 
@@ -70,22 +73,22 @@ class SlackApproval(ApprovalGateway):
 
 
 # ── session management ────────────────────────────────────────────────────────
-# One conversation per Slack user, each with an approval gateway bound to that DM.
-_SESSIONS: dict[str, Session] = {}
+# One conversation per Slack user, each with an approval gateway bound to that DM
+# so approval cards land in *that* user's DM (their phone).
+_SESSIONS: dict[str, NeovisSession] = {}
 
 
-def _get_session(config: AppConfig, audit: AuditLog, user: str, channel: str, client) -> Session:
+async def _get_session(config: AppConfig, audit: AuditLog, user: str, channel: str, client) -> NeovisSession:
     session = _SESSIONS.get(user)
     if session is None:
-        agent = build_agent(config)
-        deps = NeovisDeps(
-            policy=config.policy,
-            audit=audit,
+        session = NeovisSession(
+            config,
             approval=SlackApproval(client, channel),
-            session_id=f"slack:{user}",
+            audit=audit,
             actor=user,
+            session_id=f"slack:{user}",
         )
-        session = Session(agent=agent, deps=deps)
+        await session.connect()
         _SESSIONS[user] = session
     return session
 
@@ -123,7 +126,7 @@ def build_slack_app():
             await say("🛑 Stopping the current task.")
             return
 
-        session = _get_session(config, audit, user, channel, client)
+        session = await _get_session(config, audit, user, channel, client)
         try:
             output = await session.send(text)
         except Exception as exc:  # keep the channel alive on any tool/model error
@@ -177,7 +180,9 @@ def build_slack_app():
 async def _run() -> None:
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
-    missing = [v for v in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "NEOVIS_API_KEY")
+    # Only the Slack tokens are strictly required here — the model auth is the
+    # session's concern (subscription Claude, a proxy, or a gateway key).
+    missing = [v for v in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")
                if not os.environ.get(v)]
     if missing:
         raise SystemExit(f"Missing environment variables: {', '.join(missing)}")
