@@ -6,9 +6,25 @@ pauses on your phone with the exact tool + args and an Approve / Deny button.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 _RISK_EMOJI = {"SAFE": "🟢", "MODERATE": "🟡", "DANGEROUS": "🔴"}
+
+
+def to_mrkdwn(text: str) -> str:
+    """Convert the model's Markdown to Slack 'mrkdwn' (which is *not* Markdown)."""
+    t = text or ""
+    # [label](url) -> <url|label>
+    t = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r"<\2|\1>", t)
+    # ATX headers -> bold line
+    t = re.sub(r"^\s{0,3}#{1,6}\s*(.+?)\s*#*$", r"*\1*", t, flags=re.M)
+    # **bold** / __bold__ -> *bold*
+    t = re.sub(r"\*\*(.+?)\*\*", r"*\1*", t)
+    t = re.sub(r"__(.+?)__", r"*\1*", t)
+    # - / * bullets -> •
+    t = re.sub(r"^(\s*)[-*]\s+", r"\1• ", t, flags=re.M)
+    return t.strip()
 
 
 def _fmt_args(args: dict[str, Any]) -> str:

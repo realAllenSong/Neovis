@@ -27,7 +27,7 @@ from ...core.approval import ApprovalDecision, ApprovalGateway, ApprovalRequest
 from ...core.audit import AuditLog
 from ...core.config import AppConfig, load_config
 from ...core.session import NeovisSession
-from .blocks import approval_blocks, decided_blocks
+from .blocks import approval_blocks, decided_blocks, to_mrkdwn
 
 
 @dataclass
@@ -102,6 +102,15 @@ def _artifact_paths(text: str) -> list[str]:
     return seen
 
 
+def _format_step(name: str, tool_input: dict) -> str:
+    """A one-line 'what Neovis is doing' step for the live Slack trace."""
+    short = name.rsplit("__", 1)[-1]
+    for key in ("url", "command", "file_path", "path", "query", "pattern", "uid", "value"):
+        if tool_input.get(key):
+            return f"{short} `{str(tool_input[key])[:60]}`"
+    return short
+
+
 def build_slack_app():
     """Construct the AsyncApp with all handlers wired. Requires the 'slack' extra."""
     from slack_bolt.async_app import AsyncApp
@@ -117,6 +126,7 @@ def build_slack_app():
         user = event.get("user")
         channel = event.get("channel")
         text = (event.get("text") or "").strip()
+        msg_ts = event.get("ts")
         if not user or not text:
             return
 
@@ -126,20 +136,57 @@ def build_slack_app():
             await say("🛑 Stopping the current task.")
             return
 
+        # 👀 acknowledge, then a live "working" message that shows each step.
+        try:
+            await client.reactions_add(channel=channel, timestamp=msg_ts, name="eyes")
+        except Exception:
+            pass
+        status = await client.chat_postMessage(channel=channel, text="🤔  _Neovis is on it…_")
+        status_ts = status["ts"]
+
+        steps: list[str] = []
+
+        def on_tool(name, tool_input):
+            steps.append(_format_step(name, tool_input))
+
+        async def show_progress():
+            shown = -1
+            while True:
+                await asyncio.sleep(1.0)
+                if len(steps) != shown:
+                    shown = len(steps)
+                    trace = "\n".join(f"• {s}" for s in steps[-10:])
+                    try:
+                        await client.chat_update(
+                            channel=channel, ts=status_ts,
+                            text=(f"🔧  _working…_\n{trace}" if trace else "🤔  _Neovis is on it…_"),
+                        )
+                    except Exception:
+                        pass
+
+        updater = asyncio.create_task(show_progress())
         session = await _get_session(config, audit, user, channel, client)
         try:
-            output = await session.send(text)
+            output = await session.send(text, on_tool=on_tool)
         except Exception as exc:  # keep the channel alive on any tool/model error
-            await say(f"⚠️ Error: {exc}")
+            updater.cancel()
+            await client.chat_update(channel=channel, ts=status_ts, text=f"⚠️ Error: {exc}")
             return
+        updater.cancel()
 
-        await say(output)
+        # Replace the working message with the final answer, rendered for Slack.
+        await client.chat_update(channel=channel, ts=status_ts, text=to_mrkdwn(output) or "_(done)_")
+        try:
+            await client.reactions_remove(channel=channel, timestamp=msg_ts, name="eyes")
+            await client.reactions_add(channel=channel, timestamp=msg_ts, name="white_check_mark")
+        except Exception:
+            pass
         for path in _artifact_paths(output):
             try:
                 await client.files_upload_v2(channel=channel, file=path,
                                              title=os.path.basename(path))
             except Exception:
-                pass  # non-fatal: the text reply already went out
+                pass
 
     async def _resolve(action, body, client, approved: bool):
         rid = action["value"]

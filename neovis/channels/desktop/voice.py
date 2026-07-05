@@ -221,12 +221,26 @@ async def _run(args) -> int:
     return 0
 
 
+def _load_settings() -> dict:
+    """Editable defaults at ~/.neovis/settings.yaml (CLI flags override)."""
+    import yaml
+
+    path = Path.home() / ".neovis" / "settings.yaml"
+    try:
+        return (yaml.safe_load(path.read_text()) or {}) if path.exists() else {}
+    except Exception:
+        return {}
+
+
 def main() -> None:
+    st = _load_settings()
     p = argparse.ArgumentParser(prog="neovis-voice", description="Desktop voice assistant.")
     p.add_argument("--type", action="store_true", help="type instead of speaking (no mic)")
-    p.add_argument("--key", default="cmd_r", help="push-to-talk key (cmd_r/alt_r/ctrl_r)")
-    p.add_argument("--voice", default="sky", help="Kokoro voice: sky/adam/emma/george")
-    p.add_argument("--hotword", action="append", help="ASR hotword (repeatable)")
+    p.add_argument("--key", default=st.get("hotkey", "cmd_r"),
+                   help="push-to-talk key (cmd_r/alt_r/ctrl_r/f5/…); default from settings.yaml")
+    p.add_argument("--voice", default=st.get("voice", "sky"), help="Kokoro voice: sky/adam/emma/george")
+    p.add_argument("--hotword", action="append", default=st.get("hotwords"),
+                   help="ASR hotword (repeatable)")
     p.add_argument("--audit-db", default="neovis_audit.db")
     args = p.parse_args()
     sys.exit(asyncio.run(_run(args)))
