@@ -80,6 +80,25 @@ class SlackApproval(ApprovalGateway):
 _SESSIONS: dict[str, NeovisSession] = {}
 
 
+async def shutdown_state() -> None:
+    """Release everything bound to the current event loop. MUST be awaited on
+    that loop before it closes (the GUI stops/starts Slack across fresh loops;
+    a cached session, pending future, or lock from a dead loop poisons the next
+    run — and every leaked session is a leaked Claude subprocess)."""
+    global _ASR_LOCK
+    for session in list(_SESSIONS.values()):
+        try:
+            await asyncio.wait_for(session.disconnect(), timeout=5)
+        except Exception:
+            pass
+    _SESSIONS.clear()
+    for pending in list(_PENDING.values()):
+        if not pending.future.done():
+            pending.future.cancel()
+    _PENDING.clear()
+    _ASR_LOCK = None
+
+
 async def _get_session(config: AppConfig, audit: AuditLog, user: str, channel: str, client) -> NeovisSession:
     session = _SESSIONS.get(user)
     if session is None:

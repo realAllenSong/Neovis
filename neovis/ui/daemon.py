@@ -81,6 +81,21 @@ class NeovisDaemon:
         except Exception as exc:  # only unexpected control-plane failures reach here
             self.status["voice_msg"] = self.status["voice_msg"] or _friendly(exc)
         finally:
+            # Nothing may outlive this loop: cancel every straggler task (SDK
+            # subprocess transports, aiohttp internals) and let cancellations
+            # settle before closing, or they resurface bound to the NEXT loop.
+            try:
+                stragglers = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                for t in stragglers:
+                    t.cancel()
+                if stragglers:
+                    loop.run_until_complete(
+                        asyncio.wait(stragglers, timeout=5)
+                    )
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.run_until_complete(loop.shutdown_default_executor())
+            except Exception:
+                pass
             self._set(running=False, slack="off", voice="off")
             loop.close()
             self._loop = None
@@ -108,6 +123,7 @@ class NeovisDaemon:
 
     async def _run_slack(self) -> None:
         self._set(slack="starting", slack_msg="")
+        handler = None
         try:
             from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
@@ -128,6 +144,22 @@ class NeovisDaemon:
         except Exception as exc:
             self._set(slack="error", slack_msg=_friendly(exc))
         finally:
+            # Tear the Slack machinery down ON THIS LOOP while it's still alive.
+            # The socket client spawns its own tasks (message processor, session
+            # monitor, receiver) and owns a websocket + aiohttp session; merely
+            # cancelling start_async abandons all of that on a dying loop, and a
+            # later Start then storms "Queue is bound to a different event loop".
+            if handler is not None:
+                try:
+                    await asyncio.wait_for(handler.close_async(), timeout=5)
+                except Exception:
+                    pass
+            try:
+                from ..channels.slack.app import shutdown_state
+
+                await shutdown_state()
+            except Exception:
+                pass
             if self.status["slack"] == "on":
                 self._set(slack="off")
 
