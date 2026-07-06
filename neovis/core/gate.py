@@ -121,6 +121,11 @@ def classify(
         return Consequence.READ, "read-only tool"
     if tool_name in _WRITE_TOOLS:
         return Consequence.LOCAL_WRITE, "writes a local file"
+    if tool_name.startswith("mcp__neovis-memory__"):
+        # The agent's own bounded notes (~/.neovis/memory) — local, size-capped,
+        # audited, nothing leaves the machine. Prompting on every "remember X"
+        # would defeat the feature the user just asked for.
+        return Consequence.READ, "agent memory note (bounded, local)"
 
     action = _action(tool_name)
     blob = _text_blob(tool_input)

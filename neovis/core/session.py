@@ -27,6 +27,7 @@ from .approval import ApprovalGateway
 from .audit import AuditLog
 from .config import AppConfig
 from .gate import AutoMode, PageContext, build_post_tool_use_hook, build_pre_tool_use_hook
+from .memory import MEMORY_GUIDANCE, MemoryStore, build_memory_mcp
 
 SYSTEM_PROMPT = """\
 You are Neovis, a JARVIS-style operator running on a colleague's work computer at
@@ -77,9 +78,14 @@ def build_options(
         for stale in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
             env.pop(stale, None)
 
+    # Persistent memory: guidance + a frozen snapshot of MEMORY.md/USER.md.
+    # Snapshot at session start keeps the system prompt stable (prompt cache);
+    # mid-session memory writes land on disk and appear next session.
+    memory_block = MEMORY_GUIDANCE + MemoryStore().snapshot()
+
     return ClaudeAgentOptions(
         model=config.llm.model or None,   # empty => engine/subscription default
-        system_prompt=SYSTEM_PROMPT + (BROWSER_GUIDANCE if browser else ""),
+        system_prompt=SYSTEM_PROMPT + (BROWSER_GUIDANCE if browser else "") + memory_block,
         # The gate runs as a PreToolUse hook so it fires for EVERY tool call,
         # regardless of permission mode (can_use_tool only fires when the engine
         # decides a prompt is needed, which it often doesn't). A PostToolUse hook
@@ -132,11 +138,14 @@ class NeovisSession:
             "PreToolUse": [HookMatcher(hooks=[pre_hook])],
             "PostToolUse": [HookMatcher(hooks=[post_hook])],
         }
+        # Every session gets the persistent-memory tool alongside caller servers.
+        servers = dict(mcp_servers or {})
+        servers.setdefault("neovis-memory", build_memory_mcp(MemoryStore()))
         self.options = build_options(
             config, hooks,
             gateway_url=gateway_url, gateway_key=gateway_key,
             allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
-            mcp_servers=mcp_servers, browser=browser,
+            mcp_servers=servers, browser=browser,
         )
         self.client = ClaudeSDKClient(options=self.options)
 
