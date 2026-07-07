@@ -128,6 +128,12 @@ def classify(
         return Consequence.READ, "agent memory note (bounded, local)"
     if tool_name.startswith("mcp__neovis-recall__"):
         return Consequence.READ, "searches the user's own conversation history"
+    if tool_name.startswith("mcp__codebase-memory__"):
+        from ..mcp.code import CODE_INTEL_READ_TOOLS
+
+        if _action(tool_name) in CODE_INTEL_READ_TOOLS:
+            return Consequence.READ, "code-graph query (local, reads code only)"
+        # delete_project / manage_adr / ingest_traces fall through to LOCAL_WRITE
 
     action = _action(tool_name)
     blob = _text_blob(tool_input)

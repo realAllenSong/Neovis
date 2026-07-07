@@ -147,10 +147,15 @@ class NeovisSession:
             "PostToolUse": [HookMatcher(hooks=[post_hook])],
         }
         # Every session gets the persistent-memory + conversation-recall tools
-        # alongside whatever servers the caller provides.
+        # alongside whatever servers the caller provides, plus local code
+        # intelligence (codebase-memory-mcp) when its binary is installed.
         servers = dict(mcp_servers or {})
         servers.setdefault("neovis-memory", build_memory_mcp(MemoryStore()))
         servers.setdefault("neovis-recall", build_recall_mcp(self.transcript))
+        from ..mcp.code import code_intel_mcp
+
+        for key, cfg_entry in code_intel_mcp().items():
+            servers.setdefault(key, cfg_entry)
         self.options = build_options(
             config, hooks,
             gateway_url=gateway_url, gateway_key=gateway_key,
