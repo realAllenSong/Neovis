@@ -181,6 +181,7 @@ class VoiceLoop:
         reply = await self.session.send(
             text + VOICE_REPLY_NOTES,
             on_tool=lambda name, tool_input: self.ui.step(_format_step(name, tool_input)),
+            transcript_text=text,  # recall stores the raw utterance, not the scaffolding
         )
         spoken, detail = split_reply(reply)
         self.ui.response(spoken, detail)   # show first, then talk

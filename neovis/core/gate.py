@@ -126,6 +126,8 @@ def classify(
         # audited, nothing leaves the machine. Prompting on every "remember X"
         # would defeat the feature the user just asked for.
         return Consequence.READ, "agent memory note (bounded, local)"
+    if tool_name.startswith("mcp__neovis-recall__"):
+        return Consequence.READ, "searches the user's own conversation history"
 
     action = _action(tool_name)
     blob = _text_blob(tool_input)

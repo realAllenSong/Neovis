@@ -28,6 +28,7 @@ from .audit import AuditLog
 from .config import AppConfig
 from .gate import AutoMode, PageContext, build_post_tool_use_hook, build_pre_tool_use_hook
 from .memory import MEMORY_GUIDANCE, MemoryStore, build_memory_mcp
+from .transcript import ConversationLog, build_recall_mcp
 
 SYSTEM_PROMPT = """\
 You are Neovis, a JARVIS-style operator running on a colleague's work computer at
@@ -123,12 +124,19 @@ class NeovisSession:
         disallowed_tools: list[str] | None = None,
         mcp_servers: dict | None = None,
         browser: bool = False,
+        curate: bool = True,
     ):
         self.config = config
         self.audit = audit or AuditLog("neovis_audit.db")
         self.automode = AutoMode()
         self.approval = approval
         self.page = PageContext()
+        self.actor = actor
+        self.session_id = session_id
+        self.transcript = ConversationLog()
+        self._curate = curate
+        self.curator = None
+        self._bg: set = set()
         pre_hook = build_pre_tool_use_hook(
             config.policy, self.audit, approval, self.automode,
             page=self.page, actor=actor, session_id=session_id,
@@ -138,9 +146,11 @@ class NeovisSession:
             "PreToolUse": [HookMatcher(hooks=[pre_hook])],
             "PostToolUse": [HookMatcher(hooks=[post_hook])],
         }
-        # Every session gets the persistent-memory tool alongside caller servers.
+        # Every session gets the persistent-memory + conversation-recall tools
+        # alongside whatever servers the caller provides.
         servers = dict(mcp_servers or {})
         servers.setdefault("neovis-memory", build_memory_mcp(MemoryStore()))
+        servers.setdefault("neovis-recall", build_recall_mcp(self.transcript))
         self.options = build_options(
             config, hooks,
             gateway_url=gateway_url, gateway_key=gateway_key,
@@ -151,15 +161,24 @@ class NeovisSession:
 
     async def connect(self) -> None:
         await self.client.connect()
+        if self._curate:
+            from .curator import MemoryCurator
+
+            self.curator = MemoryCurator()
+            await self.curator.connect()  # tolerates failure (available=False)
 
     async def disconnect(self) -> None:
+        if self.curator is not None:
+            await self.curator.disconnect()
         await self.client.disconnect()
 
-    async def send(self, message: str, on_tool=None) -> str:
+    async def send(self, message: str, on_tool=None, transcript_text: str | None = None) -> str:
         """Run one top-level turn; auto-mode is scoped to this turn only.
 
         ``on_tool(name, input)`` is called for each tool the agent invokes, so a
-        caller can show a live trace of what Neovis is doing.
+        caller can show a live trace of what Neovis is doing. ``transcript_text``
+        overrides what gets recorded for recall (e.g. the raw voice transcript
+        without the reply-format scaffolding).
         """
         self.automode.reset()
         await self.client.query(message)
@@ -173,7 +192,19 @@ class NeovisSession:
                         on_tool(block.name, block.input)
             elif isinstance(msg, ResultMessage):
                 break
-        return "".join(parts).strip()
+        reply = "".join(parts).strip()
+
+        # Long-term recall: every turn lands in the FTS transcript store.
+        logged = transcript_text or message
+        try:
+            self.transcript.record(self.session_id, self.actor, "user", logged)
+            self.transcript.record(self.session_id, self.actor, "assistant", reply)
+        except Exception:
+            pass
+        # Self-learning: hand the finished turn to the background curator.
+        if self.curator is not None:
+            self.curator.review_later(logged, reply)
+        return reply
 
     def stop(self) -> None:
         # cooperative interrupt of the in-flight task

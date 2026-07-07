@@ -106,6 +106,22 @@ SLACK_BOT_TOKEN=xoxb-… SLACK_APP_TOKEN=xapp-… uv run python -m neovis.channe
 
 ---
 
+## 5.5 Memory, recall, and steer (the learning loop)
+
+- **Memory:** tell it a durable fact in passing — `btw our CTO is Alice Zhang,
+  alice.zhang@fund.com` — no need to say "remember". Later (even after a
+  restart, any channel): `email the CTO a hello` → it knows who and where.
+  Files are human-readable: `~/.neovis/memory/MEMORY.md` / `USER.md`.
+- **Recall:** `what did I ask you yesterday?` / `what was that file we made
+  last time?` → it searches `~/.neovis/transcripts.db` (FTS5, every channel's
+  turns) and answers from your own history.
+- **Steer (Slack):** while a task is visibly working, just send another
+  message — `actually, put them in ~/archive instead`. You'll see
+  `🔀 Redirecting the current task…` and it pivots with full context.
+  (`stop` still fully stops.)
+
+---
+
 ## 6. Proactive watcher — "kick off a job, ping me when it's done"
 
 In Slack **or** desktop voice:

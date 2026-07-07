@@ -79,6 +79,16 @@ class SlackApproval(ApprovalGateway):
 # so approval cards land in *that* user's DM (their phone).
 _SESSIONS: dict[str, NeovisSession] = {}
 
+# The in-flight turn per user, so a new message can STEER a running task
+# (interrupt-and-redirect) instead of colliding with it.
+_RUNNING: dict[str, "asyncio.Task"] = {}
+
+_STEER_NOTE = (
+    "[The user sent this WHILE you were mid-task — treat it as a live redirect: "
+    "drop or adjust the old plan and pivot to this, reusing the context of what "
+    "you were doing.]\n"
+)
+
 
 async def shutdown_state() -> None:
     """Release everything bound to the current event loop. MUST be awaited on
@@ -86,6 +96,9 @@ async def shutdown_state() -> None:
     a cached session, pending future, or lock from a dead loop poisons the next
     run — and every leaked session is a leaked Claude subprocess)."""
     global _ASR_LOCK
+    for task in list(_RUNNING.values()):
+        task.cancel()
+    _RUNNING.clear()
     for session in list(_SESSIONS.values()):
         try:
             await asyncio.wait_for(session.disconnect(), timeout=5)
@@ -275,6 +288,23 @@ def build_slack_app():
             await client.chat_update(channel=channel, ts=heard["ts"],
                                      text=f"🎤  _Heard:_ “{text}”")
 
+        # ── steer: a message while a task is running redirects that task ──────
+        running = _RUNNING.get(user)
+        if running is not None and not running.done():
+            if (s := _SESSIONS.get(user)) is not None:
+                s.stop()  # cooperative interrupt of the in-flight turn
+            try:
+                await client.chat_postMessage(
+                    channel=channel, text="🔀  _Redirecting the current task…_"
+                )
+            except Exception:
+                pass
+            try:  # let the interrupted turn unwind before starting the new one
+                await asyncio.wait_for(asyncio.shield(running), timeout=30)
+            except Exception:
+                pass
+            text = _STEER_NOTE + text
+
         status = await client.chat_postMessage(channel=channel, text="🤔  _Neovis is on it…_")
         status_ts = status["ts"]
 
@@ -298,29 +328,40 @@ def build_slack_app():
                     except Exception:
                         pass
 
-        updater = asyncio.create_task(show_progress())
         session = await _get_session(config, audit, user, channel, client)
-        try:
-            output = await session.send(text, on_tool=on_tool)
-        except Exception as exc:  # keep the channel alive on any tool/model error
-            updater.cancel()
-            await client.chat_update(channel=channel, ts=status_ts, text=f"⚠️ Error: {exc}")
-            return
-        updater.cancel()
 
-        # Replace the working message with the final answer, rendered for Slack.
-        await client.chat_update(channel=channel, ts=status_ts, text=to_mrkdwn(output) or "_(done)_")
-        try:
-            await client.reactions_remove(channel=channel, timestamp=msg_ts, name="eyes")
-            await client.reactions_add(channel=channel, timestamp=msg_ts, name="white_check_mark")
-        except Exception:
-            pass
-        for path in _artifact_paths(output):
+        async def work() -> None:
+            updater = asyncio.create_task(show_progress())
             try:
-                await client.files_upload_v2(channel=channel, file=path,
-                                             title=os.path.basename(path))
+                output = await session.send(text, on_tool=on_tool)
+            except Exception as exc:  # keep the channel alive on any tool/model error
+                updater.cancel()
+                await client.chat_update(channel=channel, ts=status_ts, text=f"⚠️ Error: {exc}")
+                return
+            updater.cancel()
+
+            # Replace the working message with the final answer, rendered for Slack.
+            await client.chat_update(channel=channel, ts=status_ts,
+                                     text=to_mrkdwn(output) or "_(done)_")
+            try:
+                await client.reactions_remove(channel=channel, timestamp=msg_ts, name="eyes")
+                await client.reactions_add(channel=channel, timestamp=msg_ts, name="white_check_mark")
             except Exception:
                 pass
+            for path in _artifact_paths(output):
+                try:
+                    await client.files_upload_v2(channel=channel, file=path,
+                                                 title=os.path.basename(path))
+                except Exception:
+                    pass
+
+        task = asyncio.create_task(work())
+        _RUNNING[user] = task
+        try:
+            await task
+        finally:
+            if _RUNNING.get(user) is task:
+                _RUNNING.pop(user, None)
 
     async def _resolve(action, body, client, approved: bool):
         rid = action["value"]
