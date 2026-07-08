@@ -387,7 +387,12 @@ async def build_voice_loop(*, voice="sky", hotwords=None, audit_db="neovis_audit
         mcp_servers={"neovis-watch": build_watch_mcp(manager, policy=config.policy)},
     )
     await session.connect()
-    asr = TransducerASR(hotwords=hotwords or None)
+    # Hotwords = the user's configured list + every name Neovis remembers
+    # (MEMORY.md/USER.md) — memory shapes what the ears hear.
+    from ...voice.hotwords import names_from_memory
+
+    phrases = list(dict.fromkeys((hotwords or []) + names_from_memory()))
+    asr = TransducerASR(hotwords=phrases or None)
     router = IntentRouter()
     await router.connect()
     loop = VoiceLoop(session, asr, tts, router=router, ui=ui)

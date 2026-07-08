@@ -32,6 +32,30 @@ def _export_bpe_vocab(model_path: Path, out_path: Path) -> None:
             f.write(f"{sp.id_to_piece(i)} {sp.get_score(i)}\n")
 
 
+def _ensure_bpe_vocab(model_dir: Path) -> Path | None:
+    """The bpe vocab used to tokenize hotword phrases, best source first:
+    an existing bpe.vocab → exported from bpe.model → synthesized from
+    tokens.txt for NeMo models (Parakeet ships no SentencePiece model; a
+    uniform-score vocab over its pieces is enough for hotword encoding —
+    A/B verified: 'Jiyuan Song'→'Zhiyuan Song', 'Alice Jang'→'Alice Zhang')."""
+    vocab = model_dir / "bpe.vocab"
+    if vocab.exists():
+        return vocab
+    bpe_model = model_dir / "bpe.model"
+    if bpe_model.exists():
+        _export_bpe_vocab(bpe_model, vocab)
+        return vocab
+    if "nemo" in model_dir.name or "parakeet" in model_dir.name:
+        lines = []
+        for ln in (model_dir / "tokens.txt").read_text(encoding="utf-8").splitlines():
+            parts = ln.rsplit(" ", 1)
+            if len(parts) == 2:
+                lines.append(f"{parts[0]} 0.0")
+        vocab.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return vocab
+    return None
+
+
 class TransducerASR:
     def __init__(
         self,
@@ -67,14 +91,16 @@ class TransducerASR:
         if "nemo" in d.name or "parakeet" in d.name:
             kwargs["model_type"] = "nemo_transducer"
 
-        bpe_model = d / "bpe.model"
+        # Two hotword layers, both fed the same phrases (e.g. names Neovis
+        # remembers): native beam-search biasing when a bpe vocab is available,
+        # and a fuzzy post-correction pass that always runs (asr → memory
+        # spelling, engine-agnostic).
+        self.phrases: list[str] = [p for p in (hotwords or []) if p.strip()]
         self.hotwords_active = False
-        if hotwords and bpe_model.exists():
-            bpe_vocab = d / "bpe.vocab"
-            if not bpe_vocab.exists():
-                _export_bpe_vocab(bpe_model, bpe_vocab)
+        bpe_vocab = _ensure_bpe_vocab(d) if self.phrases else None
+        if self.phrases and bpe_vocab is not None:
             hw_file = Path(tempfile.gettempdir()) / "neovis_hotwords.txt"
-            hw_file.write_text("\n".join(hotwords) + "\n")
+            hw_file.write_text("\n".join(self.phrases) + "\n")
             kwargs.update(
                 decoding_method="modified_beam_search",
                 hotwords_file=str(hw_file),
@@ -99,4 +125,9 @@ class TransducerASR:
         stream = self._rec.create_stream()
         stream.accept_waveform(sample_rate, samples)
         self._rec.decode_stream(stream)
-        return stream.result.text.strip()
+        text = stream.result.text.strip()
+        if text and self.phrases:
+            from .hotwords import correct_transcript
+
+            text = correct_transcript(text, self.phrases)
+        return text

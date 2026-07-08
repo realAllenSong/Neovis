@@ -185,8 +185,10 @@ async def _get_asr():
     async with _ASR_LOCK:
         if _ASR is None:
             from ...voice.asr import TransducerASR
+            from ...voice.hotwords import names_from_memory
 
-            _ASR = await asyncio.to_thread(TransducerASR)
+            names = names_from_memory()
+            _ASR = await asyncio.to_thread(lambda: TransducerASR(hotwords=names or None))
     return _ASR
 
 
