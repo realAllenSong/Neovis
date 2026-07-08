@@ -392,7 +392,9 @@ async def build_voice_loop(*, voice="sky", hotwords=None, audit_db="neovis_audit
     from ...voice.hotwords import names_from_memory
 
     phrases = list(dict.fromkeys((hotwords or []) + names_from_memory()))
-    asr = TransducerASR(hotwords=phrases or None)
+    from ...voice.asr import build_asr
+
+    asr = build_asr(hotwords=phrases or None)
     router = IntentRouter()
     await router.connect()
     loop = VoiceLoop(session, asr, tts, router=router, ui=ui)

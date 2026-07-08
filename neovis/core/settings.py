@@ -21,6 +21,7 @@ DEFAULTS: dict[str, Any] = {
     "hands_free": False,           # continuous VAD listening instead of hold-to-talk
     "barge_in": False,             # interrupt Neovis by talking (headphones only)
     "hotwords": [],                # ASR contextual-bias words
+    "asr": "auto",                 # auto | parakeet (fast, English) | qwen3 (multilingual)
     "slack_bot_token": "",         # xoxb-…
     "slack_app_token": "",         # xapp-…
 }

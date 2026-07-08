@@ -1,10 +1,17 @@
-"""Speech-to-text via a sherpa-onnx transducer (local, CPU, English).
+"""Speech-to-text via sherpa-onnx (local, CPU) — two engines, one interface.
 
-A transducer model is chosen specifically because it supports **hotwords**
-(contextual biasing): fund-specific proper nouns — tickers, colleagues' names —
-otherwise get transcribed as phonetic neighbours. Hotwords need the model's
-``bpe.model`` (to tokenise the phrases) and ``modified_beam_search``; without it
-we fall back to plain decoding.
+* **Parakeet-TDT-0.6b-v2 int8** (default) — transducer, English-only, RTF ~0.04
+  on an M-series CPU. Hotword biasing via ``modified_beam_search``.
+* **Qwen3-ASR-0.6B int8** — LLM-decoder, multilingual (Chinese + English +
+  code-switching), RTF ~0.14 on the same CPU. Hotword biasing via its native
+  context prompt. Pick with ``asr: qwen3`` in ``~/.neovis/settings.yaml``.
+
+Both engines get the same phrases (the names Neovis remembers) and both are
+followed by the engine-agnostic fuzzy correction pass (:mod:`.hotwords`).
+Measured head-to-head (same audio, 2 threads):
+
+    parakeet  rtf=0.04  'Alice Jang' → +hotwords 'Alice Zhang'
+    qwen3     rtf=0.14  'Alice Jiang' → +hotwords 'Alice Zhang'
 """
 
 from __future__ import annotations
@@ -19,7 +26,35 @@ from . import MODELS_DIR
 # which ships bpe.model so hotwords (contextual biasing) work.
 PARAKEET_DIR = MODELS_DIR / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
 ZIPFORMER_DIR = MODELS_DIR / "sherpa-onnx-zipformer-en-2023-04-01"
+QWEN3_DIR = MODELS_DIR / "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
 DEFAULT_ASR_DIR = PARAKEET_DIR if PARAKEET_DIR.exists() else ZIPFORMER_DIR
+
+
+class _Transcriber:
+    """Shared decode + hotword-correction pass over a sherpa-onnx recognizer."""
+
+    _rec = None
+    phrases: list[str] = []
+
+    def transcribe(self, wav_path: str | Path) -> str:
+        import soundfile as sf
+
+        samples, sr = sf.read(str(wav_path), dtype="float32")
+        if getattr(samples, "ndim", 1) > 1:
+            samples = samples[:, 0]
+        return self.transcribe_samples(samples, sr)
+
+    def transcribe_samples(self, samples, sample_rate: int) -> str:
+        """Transcribe raw float32 mono samples (for live mic capture)."""
+        stream = self._rec.create_stream()
+        stream.accept_waveform(sample_rate, samples)
+        self._rec.decode_stream(stream)
+        text = stream.result.text.strip()
+        if text and self.phrases:
+            from .hotwords import correct_transcript
+
+            text = correct_transcript(text, self.phrases)
+        return text
 
 
 def _export_bpe_vocab(model_path: Path, out_path: Path) -> None:
@@ -56,7 +91,7 @@ def _ensure_bpe_vocab(model_dir: Path) -> Path | None:
     return None
 
 
-class TransducerASR:
+class TransducerASR(_Transcriber):
     def __init__(
         self,
         model_dir: str | Path = DEFAULT_ASR_DIR,
@@ -112,22 +147,57 @@ class TransducerASR:
 
         self._rec = sherpa_onnx.OfflineRecognizer.from_transducer(**kwargs)
 
-    def transcribe(self, wav_path: str | Path) -> str:
-        import soundfile as sf
 
-        samples, sr = sf.read(str(wav_path), dtype="float32")
-        if getattr(samples, "ndim", 1) > 1:
-            samples = samples[:, 0]
-        return self.transcribe_samples(samples, sr)
+class Qwen3ASR(_Transcriber):
+    """Qwen3-ASR-0.6B int8 — multilingual (Chinese/English/code-switching),
+    hotwords via the model's native context prompt. ~3-4x slower than Parakeet
+    on CPU but still well under real time."""
 
-    def transcribe_samples(self, samples, sample_rate: int) -> str:
-        """Transcribe raw float32 mono samples (for live mic capture)."""
-        stream = self._rec.create_stream()
-        stream.accept_waveform(sample_rate, samples)
-        self._rec.decode_stream(stream)
-        text = stream.result.text.strip()
-        if text and self.phrases:
-            from .hotwords import correct_transcript
+    def __init__(
+        self,
+        model_dir: str | Path = QWEN3_DIR,
+        *,
+        hotwords: list[str] | None = None,
+        num_threads: int = 2,
+    ):
+        import sherpa_onnx
 
-            text = correct_transcript(text, self.phrases)
-        return text
+        d = Path(model_dir)
+        self.phrases = [p for p in (hotwords or []) if p.strip()]
+        self.hotwords_active = bool(self.phrases)
+        self._rec = sherpa_onnx.OfflineRecognizer.from_qwen3_asr(
+            conv_frontend=str(d / "conv_frontend.onnx"),
+            encoder=str(d / "encoder.int8.onnx"),
+            decoder=str(d / "decoder.int8.onnx"),
+            tokenizer=str(d / "tokenizer"),
+            num_threads=num_threads,
+            hotwords=", ".join(self.phrases),
+        )
+
+
+def _select_engine(engine: str, parakeet: bool, qwen3: bool) -> str:
+    """Pure selection logic: an explicit, installed choice wins; 'auto' prefers
+    parakeet (fastest), then qwen3, then the zipformer fallback."""
+    if engine == "qwen3" and qwen3:
+        return "qwen3"
+    if engine == "parakeet" and parakeet:
+        return "parakeet"
+    if parakeet:
+        return "parakeet"
+    if qwen3:
+        return "qwen3"
+    return "zipformer"
+
+
+def build_asr(*, engine: str | None = None, hotwords: list[str] | None = None):
+    """The configured ASR engine (settings key ``asr``: auto|parakeet|qwen3)."""
+    if engine is None:
+        from ..core.settings import load
+
+        engine = str(load().get("asr") or "auto")
+    choice = _select_engine(engine, PARAKEET_DIR.exists(), QWEN3_DIR.exists())
+    if choice == "qwen3":
+        return Qwen3ASR(hotwords=hotwords)
+    if choice == "parakeet":
+        return TransducerASR(model_dir=PARAKEET_DIR, hotwords=hotwords)
+    return TransducerASR(model_dir=ZIPFORMER_DIR, hotwords=hotwords)
