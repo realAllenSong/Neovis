@@ -132,28 +132,61 @@ class VoiceLoop:
         self._wav = Path(tempfile.gettempdir()) / "neovis_say.wav"
         self._playing = None          # subprocess.Popen while speaking (barge-in)
         self._speak_blocking = True   # hands-free flips this so we keep listening
+        self._last_spoken = ""        # for echo detection (hearing ourselves)
+        self._speak_end = 0.0         # when playback last stopped
 
     def speak(self, text: str, *, blocking: bool | None = None) -> None:
+        import time as _time
+
         if blocking is None:
             blocking = self._speak_blocking
+        self._last_spoken = f"{self._last_spoken} {text}"[-400:]  # echo reference
         self.tts.synthesize(text, self._wav)
         cmd = _play_cmd(str(self._wav))
         if cmd is None:
             _play(str(self._wav))     # blocking fallback (e.g. Windows winsound)
+            self._speak_end = _time.time()
             return
         if blocking:
             subprocess.run(cmd)
+            self._speak_end = _time.time()
         else:
             self._playing = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     @property
     def speaking(self) -> bool:
-        return self._playing is not None and self._playing.poll() is None
+        import time as _time
+
+        alive = self._playing is not None and self._playing.poll() is None
+        if not alive and self._playing is not None:
+            self._playing = None
+            self._speak_end = _time.time()
+        return alive
 
     def stop_speaking(self) -> None:
+        import time as _time
+
         if self._playing is not None and self._playing.poll() is None:
             self._playing.terminate()
         self._playing = None
+        self._speak_end = _time.time()
+
+    def _is_own_echo(self, text: str) -> bool:
+        """True when a transcript is (a fragment of) what Neovis itself just
+        said — its speaker leaking into the mic. Without echo cancellation this
+        is the only thing standing between us and Neovis chatting with itself."""
+        import time as _time
+        from difflib import SequenceMatcher
+
+        if not text or not self._last_spoken:
+            return False
+        if not self.speaking and (_time.time() - self._speak_end) > 2.0:
+            return False  # too long after playback to be a leak
+        a, b = text.lower().strip(" .,!?"), self._last_spoken.lower()
+        if a in b:
+            return True
+        m = SequenceMatcher(None, a, b).find_longest_match(0, len(a), 0, len(b))
+        return m.size >= 0.8 * len(a)
 
     async def handle_utterance(self, text: str) -> str:
         # The fast model (Haiku) decides what this means; the big model executes.
@@ -161,32 +194,68 @@ class VoiceLoop:
 
         self.ui.thinking(text)
         intent = _fast_rules(text) if self.router is not None else rule_fallback(text)
+        send_task = None
         if intent is None:
-            # Almost certainly a task → acknowledge INSTANTLY (JARVIS-style) so
-            # the user knows they were heard while the slower brains spin up.
-            self.speak("On it.", blocking=False)
+            # Speculative execution: ≥3 words is almost certainly a task, so
+            # start the agent turn NOW and let Haiku classify in parallel — its
+            # 2-3 s no longer sits in front of every reply. 1-2 word utterances
+            # ("hey", "thanks") are usually chat/stop: don't burn a main-model
+            # turn on them, just wait for Haiku.
+            words = text.split()
+            if len(words) >= 3:
+                # Ack real requests instantly — but "On it." after "thanks so
+                # much" would be absurd, so social openers don't get one.
+                social = words[0].lower().strip(",.!") in (
+                    "thanks", "thank", "ok", "okay", "cool", "nice", "great",
+                    "perfect", "awesome", "good", "hey", "hi", "hello")
+                if len(words) >= 4 and not social:
+                    self.speak("On it.", blocking=False)
+                send_task = asyncio.ensure_future(self._run_task(text))
             intent = await self.router.classify(text)
         action = intent.get("action", "task")
 
+        async def unwind():
+            """Abandon a mis-speculated turn AFTER the user already got their
+            answer — interrupting the engine can take seconds and must never
+            sit in front of the reply."""
+            if send_task is not None:
+                self.session.stop()
+                await asyncio.gather(send_task, return_exceptions=True)
+
         if action == "stop":
-            self.session.stop()
             self.ui.response("Stopping.", "")
-            self.speak("Stopping.")
+            self.speak("Stopping.", blocking=False)
+            self.session.stop()
+            await unwind()
             return "(stopped)"
         if action == "voice":
             out = self._switch_voice(intent.get("name"), intent.get("accent"), intent.get("gender"))
             self.ui.idle()
+            await unwind()
             return out
-        # task → the gated agent, with a live step ticker on the overlay
-        reply = await self.session.send(
-            text + VOICE_REPLY_NOTES,
-            on_tool=lambda name, tool_input: self.ui.step(_format_step(name, tool_input)),
-            transcript_text=text,  # recall stores the raw utterance, not the scaffolding
-        )
+        if action == "chat":
+            # Pure small talk: Haiku already wrote the line — speak it now
+            # (~2-3 s total) instead of a 10 s main-model turn on "hey".
+            line = str(intent.get("reply") or "Hey — what can I do for you?")
+            self.ui.response(line, "")
+            self.speak(line)
+            await unwind()
+            return line
+        # task → the (already running) gated agent turn
+        if send_task is None:
+            send_task = asyncio.ensure_future(self._run_task(text))
+        reply = await send_task
         spoken, detail = split_reply(reply)
         self.ui.response(spoken, detail)   # show first, then talk
         self.speak(spoken)
         return reply
+
+    async def _run_task(self, text: str) -> str:
+        return await self.session.send(
+            text + VOICE_REPLY_NOTES,
+            on_tool=lambda name, tool_input: self.ui.step(_format_step(name, tool_input)),
+            transcript_text=text,  # recall stores the raw utterance, not the scaffolding
+        )
 
     def _switch_voice(self, name: str | None, accent: str | None, gender: str | None) -> str:
         """Fill the missing dimension from the current voice and announce; if
@@ -320,6 +389,18 @@ class VoiceLoop:
         was_speaking = False
         quiet_until = 0.0
         in_speech = False
+
+        def purge():
+            """Drop everything the mic collected that isn't fresh user speech:
+            the VAD state, and any queued audio backlog (e.g. the 10 s of chunks
+            that piled up while a turn was being handled)."""
+            vad.reset()
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+
         try:
             while True:
                 try:
@@ -328,31 +409,44 @@ class VoiceLoop:
                     continue
                 frames = chunk.flatten()
 
-                if not barge_in:
-                    if self.speaking:
-                        was_speaking = True
-                        continue  # drop mic input entirely while talking
-                    if was_speaking:
-                        was_speaking = False
-                        vad.reset()  # discard anything captured around playback
-                        quiet_until = _time.time() + 0.35  # echo tail
-                        continue
-                    if _time.time() < quiet_until:
-                        continue
+                if self.speaking:
+                    was_speaking = True
+                    if not barge_in:
+                        continue  # mic is muted while Neovis talks (speaker echo)
+                elif was_speaking:
+                    was_speaking = False
+                    purge()  # discard anything captured around playback
+                    quiet_until = _time.time() + 0.35  # echo tail
+                    continue
+                elif _time.time() < quiet_until:
+                    continue
 
                 vad.accept(frames)
-                self.ui.level(float(np.sqrt((frames ** 2).mean())))
-                if barge_in and self.speaking and vad.is_speaking():
+                rms = float(np.sqrt((frames ** 2).mean()))
+                self.ui.level(rms)
+                # Barge-in needs BOTH voice activity and real loudness: a close
+                # mic'd human is far louder than speaker leak, so this keeps
+                # speaker users from having replies cut by their own echo.
+                if barge_in and self.speaking and vad.is_speaking() and rms > 0.04:
                     self.stop_speaking()  # talk over Neovis to cut it off
+                    purge()               # …but don't transcribe the trigger
+                    quiet_until = _time.time() + 0.35
+                    continue
                 if vad.is_speaking() and not in_speech:
                     in_speech = True
                     self.ui.listening()
                 for seg in vad.segments():
                     in_speech = False
                     text = self.asr.transcribe_samples(seg, samplerate)
-                    if text.strip():
-                        print("you:", text)
-                        print("neovis>", await self.handle_utterance(text))
+                    if not text.strip():
+                        continue
+                    if self._is_own_echo(text):
+                        print(f"(echo ignored: {text!r})")
+                        continue
+                    print("you:", text)
+                    print("neovis>", await self.handle_utterance(text))
+                    purge()  # the turn took seconds — drop the stale backlog
+                    quiet_until = _time.time() + 0.3
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:

@@ -70,7 +70,9 @@ class KokoroTTS:
                 num_threads=num_threads,
                 provider="cpu",
             ),
-            max_num_sentences=2,
+            # Kokoro synthesizes whole texts in one pass; any other value makes
+            # sherpa print a warning to stderr on every single synthesis.
+            max_num_sentences=1,
         )
         self._tts = sherpa_onnx.OfflineTts(config)
         self.speed = speed

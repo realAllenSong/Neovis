@@ -36,6 +36,10 @@ Choose "action":
     "gender": "male" | "female" | null         (e.g. "a guy" → male, "a lady" → female)
     "name":   "sky" | "adam" | "emma" | "george" | null  (only if named)
 - "stop" — they want to stop / cancel / abort the current task.
+- "chat" — the message is NOTHING BUT a greeting, thanks, or small talk with no
+  request in it ("hey", "thanks!", "good morning"). Also fill:
+    "reply": a short, warm, JARVIS-butler-style response (max 12 words, no markdown)
+  If there is ANY task mixed in ("hey, open chrome"), it is "task", not "chat".
 - "task" — anything else: a request for the agent to DO something on the computer.
 
 Only classify the CURRENT message; ignore earlier ones. Examples:
@@ -43,6 +47,8 @@ Only classify the CURRENT message; ignore earlier ones. Examples:
 "talk like a deep-voiced guy"  -> {"action":"voice","accent":null,"gender":"male","name":null}
 "switch to emma"               -> {"action":"voice","accent":null,"gender":null,"name":"emma"}
 "cut it out"                    -> {"action":"stop"}
+"hey"                           -> {"action":"chat","reply":"Hey! What can I do for you?"}
+"thanks, that's perfect"        -> {"action":"chat","reply":"Anytime."}
 "email my boss the q2 report"  -> {"action":"task"}"""
 
 
