@@ -36,10 +36,12 @@ Choose "action":
     "gender": "male" | "female" | null         (e.g. "a guy" → male, "a lady" → female)
     "name":   "sky" | "adam" | "emma" | "george" | null  (only if named)
 - "stop" — they want to stop / cancel / abort the current task.
-- "chat" — the message is NOTHING BUT a greeting, thanks, or small talk with no
-  request in it ("hey", "thanks!", "good morning"). Also fill:
-    "reply": a short, warm, JARVIS-butler-style response (max 12 words, no markdown)
-  If there is ANY task mixed in ("hey, open chrome"), it is "task", not "chat".
+- "chat" — a greeting, thanks, small talk, OR a general question you can fully
+  answer yourself in one short sentence WITHOUT touching the computer (what can
+  you do, how are you, banter). Also fill:
+    "reply": a short, warm, JARVIS-butler-style response (max 20 words, no markdown)
+  NOT chat if it needs the machine (files, apps, screen, status of anything),
+  or mixes in a request ("hey, open chrome") — those are "task".
 - "task" — anything else: a request for the agent to DO something on the computer.
 
 Only classify the CURRENT message; ignore earlier ones. Examples:

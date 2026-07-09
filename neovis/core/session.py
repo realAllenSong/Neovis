@@ -64,6 +64,7 @@ def build_options(
     disallowed_tools: list[str] | None = None,
     mcp_servers: dict | None = None,
     browser: bool = False,
+    cwd: str | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions pointing the engine at the model endpoint."""
     env = dict(os.environ)
@@ -103,7 +104,7 @@ def build_options(
         # default and break the control stream; give the buffer generous room.
         max_buffer_size=64 * 1024 * 1024,
         env=env,
-        cwd=os.getcwd(),
+        cwd=cwd or os.getcwd(),
     )
 
 
@@ -125,6 +126,7 @@ class NeovisSession:
         mcp_servers: dict | None = None,
         browser: bool = False,
         curate: bool = True,
+        cwd: str | None = None,
     ):
         self.config = config
         self.audit = audit or AuditLog("neovis_audit.db")
@@ -160,7 +162,7 @@ class NeovisSession:
             config, hooks,
             gateway_url=gateway_url, gateway_key=gateway_key,
             allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
-            mcp_servers=servers, browser=browser,
+            mcp_servers=servers, browser=browser, cwd=cwd,
         )
         self.client = ClaudeSDKClient(options=self.options)
 
@@ -177,13 +179,16 @@ class NeovisSession:
             await self.curator.disconnect()
         await self.client.disconnect()
 
-    async def send(self, message: str, on_tool=None, transcript_text: str | None = None) -> str:
+    async def send(self, message: str, on_tool=None, transcript_text: str | None = None,
+                   on_text=None) -> str:
         """Run one top-level turn; auto-mode is scoped to this turn only.
 
         ``on_tool(name, input)`` is called for each tool the agent invokes, so a
-        caller can show a live trace of what Neovis is doing. ``transcript_text``
-        overrides what gets recorded for recall (e.g. the raw voice transcript
-        without the reply-format scaffolding).
+        caller can show a live trace of what Neovis is doing. ``on_text(text)``
+        fires for each assistant text block AS IT STREAMS — the voice channel
+        narrates these aloud so the user hears progress, not silence.
+        ``transcript_text`` overrides what gets recorded for recall (e.g. the
+        raw voice transcript without the reply-format scaffolding).
         """
         self.automode.reset()
         await self.client.query(message)
@@ -193,11 +198,13 @@ class NeovisSession:
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         parts.append(block.text)
+                        if on_text:
+                            on_text(block.text)
                     elif isinstance(block, ToolUseBlock) and on_tool:
                         on_tool(block.name, block.input)
             elif isinstance(msg, ResultMessage):
                 break
-        reply = "".join(parts).strip()
+        reply = "\n".join(p.strip() for p in parts if p.strip())
 
         # Long-term recall: every turn lands in the FTS transcript store.
         logged = transcript_text or message

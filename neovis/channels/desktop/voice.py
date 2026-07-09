@@ -83,15 +83,34 @@ class VoiceUI:
 
 
 # Appended to every voice utterance sent to the agent: the transcript is lossy,
-# and the reply must lead with one short speakable line (detail after '---').
+# interim text is narrated aloud, and the reply must lead with one short
+# speakable line (detail after '---').
 VOICE_REPLY_NOTES = (
     "\n\n[Voice notes: the message above is a speech transcript and may contain "
     "recognition errors — interpret it charitably before acting (e.g. 'we chat' "
-    "likely means WeChat). Answer for voice: the FIRST line of your reply must "
-    "be ONE short conversational sentence (under 18 words, no markdown) to be "
-    "read aloud. If more detail is useful, put it after a line containing only "
-    "'---'; it will be shown on screen, not spoken.]"
+    "likely means WeChat). This is a VOICE conversation: any text you write is "
+    "READ ALOUD to the user. While working, before each batch of tool calls, "
+    "say ONE short sentence about what you're doing next ('Checking the "
+    "repository now.'). When done, your final text must START with one short "
+    "conversational sentence summarizing the RESULT itself (the number, the "
+    "name, the outcome — not 'done'); optional detail goes after a line "
+    "containing only '---' and is shown on screen, not spoken. Casual or "
+    "conversational questions deserve a direct conversational answer — do NOT "
+    "investigate files or run tools unless the request actually needs the "
+    "machine.]"
 )
+
+
+def _first_sentence(text: str, limit: int = 140) -> str:
+    """The first sentence of a text block, cleaned for TTS."""
+    t = re.sub(r"[*_`#>|]+", "", text or "").strip()
+    if not t:
+        return ""
+    for stop in (". ", "! ", "? ", "\n"):
+        idx = t.find(stop)
+        if 0 < idx < limit:
+            return t[: idx + 1].strip()
+    return t[:limit].strip()
 
 
 def split_reply(reply: str) -> tuple[str, str]:
@@ -121,6 +140,41 @@ def _format_step(name: str, tool_input: dict) -> str:
     return short
 
 
+class _Trace:
+    """White-box timing for one voice turn → ~/.neovis/voice_trace.jsonl +
+    one compact console line. This is how we debug 'why was that slow'."""
+
+    PATH = Path.home() / ".neovis" / "voice_trace.jsonl"
+
+    def __init__(self, utterance: str, asr_s: float | None = None):
+        import time as _time
+
+        self.t0 = _time.time()
+        self.d: dict = {"ts": round(self.t0, 2), "utterance": utterance[:200]}
+        if asr_s is not None:
+            self.d["asr_s"] = round(asr_s, 2)
+
+    def mark(self, key: str) -> None:
+        import time as _time
+
+        self.d[f"{key}_s"] = round(_time.time() - self.t0, 2)
+
+    def done(self, **extra) -> None:
+        import json
+
+        self.d.update(extra)
+        try:
+            self.PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(self.d, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        stages = " ".join(
+            f"{k[:-2]}={self.d[k]}s" for k in self.d if k.endswith("_s")
+        )
+        print(f"⏱ [{self.d.get('action', '?')}] {stages}")
+
+
 class VoiceLoop:
     def __init__(self, session: NeovisSession, asr: TransducerASR, tts: KokoroTTS,
                  router=None, ui: VoiceUI | None = None):
@@ -134,17 +188,26 @@ class VoiceLoop:
         self._speak_blocking = True   # hands-free flips this so we keep listening
         self._last_spoken = ""        # for echo detection (hearing ourselves)
         self._speak_end = 0.0         # when playback last stopped
+        self._narrated = ""           # last interim line narrated aloud
+        self._narrated_played = False  # whether that line actually got voiced
+        self._trace: _Trace | None = None
+        self.last_asr_s: float | None = None
 
-    def speak(self, text: str, *, blocking: bool | None = None) -> None:
+    def _synth(self, text: str) -> Path:
+        """Synthesize to a fresh wav (no reuse races between ack/narration/reply)."""
+        self._wav_seq = getattr(self, "_wav_seq", 0) + 1
+        wav = Path(tempfile.gettempdir()) / f"neovis_say_{self._wav_seq % 8}.wav"
+        self._last_spoken = f"{self._last_spoken} {text}"[-400:]  # echo reference
+        self.tts.synthesize(text, wav)
+        self._wav = wav  # last spoken clip (tests/tools peek at it)
+        return wav
+
+    def _play_file(self, wav: Path, *, blocking: bool) -> None:
         import time as _time
 
-        if blocking is None:
-            blocking = self._speak_blocking
-        self._last_spoken = f"{self._last_spoken} {text}"[-400:]  # echo reference
-        self.tts.synthesize(text, self._wav)
-        cmd = _play_cmd(str(self._wav))
+        cmd = _play_cmd(str(wav))
         if cmd is None:
-            _play(str(self._wav))     # blocking fallback (e.g. Windows winsound)
+            _play(str(wav))           # blocking fallback (e.g. Windows winsound)
             self._speak_end = _time.time()
             return
         if blocking:
@@ -152,6 +215,19 @@ class VoiceLoop:
             self._speak_end = _time.time()
         else:
             self._playing = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def speak(self, text: str, *, blocking: bool | None = None) -> None:
+        if blocking is None:
+            blocking = self._speak_blocking
+        self._play_file(self._synth(text), blocking=blocking)
+
+    async def _wait_quiet(self, timeout: float = 8.0) -> None:
+        """Let any in-flight (non-blocking) speech finish before the next clip."""
+        import time as _time
+
+        t0 = _time.time()
+        while self.speaking and _time.time() - t0 < timeout:
+            await asyncio.sleep(0.08)
 
     @property
     def speaking(self) -> bool:
@@ -192,6 +268,9 @@ class VoiceLoop:
         # The fast model (Haiku) decides what this means; the big model executes.
         from ...core.router import _fast_rules, rule_fallback
 
+        trace = _Trace(text, asr_s=self.last_asr_s)
+        self._trace = trace
+        self._narrated = ""
         self.ui.thinking(text)
         intent = _fast_rules(text) if self.router is not None else rule_fallback(text)
         send_task = None
@@ -210,9 +289,12 @@ class VoiceLoop:
                     "perfect", "awesome", "good", "hey", "hi", "hello")
                 if len(words) >= 4 and not social:
                     self.speak("On it.", blocking=False)
+                    trace.mark("ack")
                 send_task = asyncio.ensure_future(self._run_task(text))
             intent = await self.router.classify(text)
+            trace.mark("router")
         action = intent.get("action", "task")
+        trace.d["action"] = action
 
         async def unwind():
             """Abandon a mis-speculated turn AFTER the user already got their
@@ -227,33 +309,67 @@ class VoiceLoop:
             self.speak("Stopping.", blocking=False)
             self.session.stop()
             await unwind()
+            trace.done()
             return "(stopped)"
         if action == "voice":
             out = self._switch_voice(intent.get("name"), intent.get("accent"), intent.get("gender"))
             self.ui.idle()
             await unwind()
+            trace.done()
             return out
         if action == "chat":
             # Pure small talk: Haiku already wrote the line — speak it now
             # (~2-3 s total) instead of a 10 s main-model turn on "hey".
             line = str(intent.get("reply") or "Hey — what can I do for you?")
-            self.ui.response(line, "")
-            self.speak(line)
+            wav = self._synth(line)
+            self.ui.response(line, "")          # text and audio land together
+            trace.mark("spoken")
+            self._play_file(wav, blocking=self._speak_blocking)
             await unwind()
+            trace.done()
             return line
         # task → the (already running) gated agent turn
         if send_task is None:
             send_task = asyncio.ensure_future(self._run_task(text))
         reply = await send_task
+        trace.mark("turn")
         spoken, detail = split_reply(reply)
-        self.ui.response(spoken, detail)   # show first, then talk
-        self.speak(spoken)
+        if self._narrated:
+            # Narration IS the speech: the last streamed line is the answer
+            # line; the panel shows the whole story (each stage + result).
+            spoken, detail = self._narrated, reply.strip()
+        if self._narrated and self._narrated_played:
+            self.ui.response(spoken, detail)    # already heard it — just show
+        else:
+            await self._wait_quiet()            # let a narration clip finish
+            wav = self._synth(spoken)
+            self.ui.response(spoken, detail)    # text and audio land together
+            trace.mark("spoken")
+            self._play_file(wav, blocking=self._speak_blocking)
+        trace.done(narrated=bool(self._narrated))
         return reply
+
+    def _narrate(self, block_text: str) -> None:
+        """Speak the model's interim commentary as it streams ('Checking the
+        repository now.') so working time is narrated, not silent."""
+        line = _first_sentence(block_text)
+        if not line:
+            return
+        self._narrated = line
+        self._narrated_played = False
+        if self._trace is not None and "first_voice_s" not in self._trace.d:
+            self._trace.mark("first_voice")
+        self.ui.step(line[:64])
+        if self.speaking:
+            return  # never overlap clips; the capsule still shows the line
+        self._play_file(self._synth(line), blocking=False)
+        self._narrated_played = True
 
     async def _run_task(self, text: str) -> str:
         return await self.session.send(
             text + VOICE_REPLY_NOTES,
             on_tool=lambda name, tool_input: self.ui.step(_format_step(name, tool_input)),
+            on_text=self._narrate,
             transcript_text=text,  # recall stores the raw utterance, not the scaffolding
         )
 
@@ -343,8 +459,12 @@ class VoiceLoop:
         try:
             while True:
                 if pending_audio:
+                    import time as _time
+
                     self.ui.thinking("…")
+                    _t0 = _time.time()
                     text = self.asr.transcribe_samples(pending_audio.pop(0), samplerate)
+                    self.last_asr_s = _time.time() - _t0
                     print("you:", text or "(nothing heard)")
                     if text.strip():
                         print("neovis>", await self.handle_utterance(text))
@@ -437,7 +557,9 @@ class VoiceLoop:
                     self.ui.listening()
                 for seg in vad.segments():
                     in_speech = False
+                    _t0 = _time.time()
                     text = self.asr.transcribe_samples(seg, samplerate)
+                    self.last_asr_s = _time.time() - _t0
                     if not text.strip():
                         continue
                     if self._is_own_echo(text):
@@ -479,6 +601,10 @@ async def build_voice_loop(*, voice="sky", hotwords=None, audit_db="neovis_audit
         config, approval=approval or ConsoleApproval(), audit=AuditLog(audit_db),
         actor="voice", session_id="desktop-voice",
         mcp_servers={"neovis-watch": build_watch_mcp(manager, policy=config.policy)},
+        # A workstation JARVIS works from the user's home, not from whatever
+        # repo the app was launched in — otherwise "what's going on?" turns
+        # into an uninvited investigation of Neovis's own source tree.
+        cwd=str(Path.home()),
     )
     await session.connect()
     # Hotwords = the user's configured list + every name Neovis remembers

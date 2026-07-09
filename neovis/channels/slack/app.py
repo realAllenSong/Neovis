@@ -131,6 +131,7 @@ async def _get_session(config: AppConfig, audit: AuditLog, user: str, channel: s
             actor=user,
             session_id=f"slack:{user}",
             mcp_servers={"neovis-watch": build_watch_mcp(manager, policy=config.policy)},
+            cwd=str(Path.home()),  # the workstation, not Neovis's own repo
         )
         await session.connect()
         _SESSIONS[user] = session

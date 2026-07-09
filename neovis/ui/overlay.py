@@ -129,7 +129,9 @@ class NeovisOverlay(QWidget):
             self._head_h, self._panel_h = self._measure_panel(spoken, detail)
         self._enter(self._RESPONSE, spoken, pill=not detail)
         self._anim.stop()
-        self._auto_hide(16000 if detail else 6000)
+        # Detail panels hold long content — give the user real time to read
+        # (click dismisses anytime; the next interaction replaces it).
+        self._auto_hide(45000 if detail else 8000)
 
     def show_error(self, msg: str) -> None:
         self._enter(self._ERROR, msg[:60], pill=True)
