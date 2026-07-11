@@ -47,23 +47,49 @@ def _bare_loop() -> VoiceLoop:
     return lp
 
 
-def test_bank_builds_all_kinds(tmp_path, monkeypatch):
-    import tempfile
+def test_repertoire_is_wide():
+    lines = VoiceLoop._BANK_LINES
+    assert len(lines["ack"]) >= 30      # variety sells the illusion
+    assert len(lines["hold"]) >= 10
+    assert len(set(lines["ack"])) == len(lines["ack"])  # no duplicates
+    assert all(len(l.split()) <= 8 for kind in lines.values() for l in kind)
 
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+
+def test_bank_seeds_all_kinds_instantly(tmp_path, monkeypatch):
+    monkeypatch.setattr(VoiceLoop, "BANK_CACHE", tmp_path)
     lp = _bare_loop()
-    lp.build_ack_bank()
+    lp.build_ack_bank()   # no event loop → seeds only, background fill skipped
     assert set(lp._bank) == {"ack", "hold", "stop"}
     for clips in lp._bank.values():
         assert clips and all(Path(w).exists() for _, w in clips)
 
 
-def test_play_cached_updates_echo_reference(tmp_path, monkeypatch):
-    import tempfile
-
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+def test_bank_reloads_from_disk_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(VoiceLoop, "BANK_CACHE", tmp_path)
     lp = _bare_loop()
     lp.build_ack_bank()
+    synth_calls = []
+    lp.tts.synthesize = lambda t, p: synth_calls.append(t)  # would fail if used
+    lp.build_ack_bank()   # second boot: everything seeded loads from disk
+    assert not synth_calls
+    assert all(lp._bank[k] for k in lp._bank)
+
+
+def test_play_cached_avoids_recent_repeats_and_marks_echo(tmp_path, monkeypatch):
+    monkeypatch.setattr(VoiceLoop, "BANK_CACHE", tmp_path)
+    lp = _bare_loop()
+    # pre-populate the full stop repertoire so rotation has room
+    for line in VoiceLoop._BANK_LINES["stop"]:
+        p = lp._bank_path("stop", line)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"RIFF0000WAVE")
+    lp.build_ack_bank()
     lp._play_file = lambda wav, blocking: None  # don't actually play
-    lp.play_cached("stop")
-    assert "Stopping." in lp._last_spoken  # echo filter knows what we said
+    played = []
+    for _ in range(6):
+        before = lp._last_spoken
+        lp.play_cached("stop")
+        played.append(lp._last_spoken[len(before):].strip())
+    assert len(set(played)) == len(played)  # 6 clips available → no repeat
+    assert any("topp" in p or "ancel" in p or "ropping" in p for p in played)
+    assert lp._last_spoken  # echo filter knows what we said

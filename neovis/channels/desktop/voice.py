@@ -263,40 +263,101 @@ class VoiceLoop:
             await asyncio.sleep(0.08)
 
     # ── instant clips (GPT-Live-style acknowledgments) ────────────────────────
+    # A wide, rotating repertoire: one canned "On it." repeated forever breaks
+    # the illusion; fifty task-neutral variations, never repeating recently,
+    # read as a butler improvising — at ~50 ms, because they're all canned.
     _BANK_LINES = {
-        "ack": ("On it.", "Sure.", "Mm-hm, on it."),
-        "hold": ("One sec — still with you.", "Still on it."),
-        "stop": ("Stopping.",),
+        "ack": (
+            "On it.", "Sure.", "Sure thing.", "Right away.", "Absolutely.",
+            "Of course.", "You got it.", "Consider it done.", "Happy to.",
+            "Okay, on it.", "Let me take a look.", "Looking into it now.",
+            "Let me check.", "Checking now.", "Let's see.", "Give me a moment.",
+            "One moment.", "Just a moment.", "Working on it.", "Getting to it.",
+            "On the case.", "Right, checking now.", "Alright, one sec.",
+            "Leave it to me.", "Let me see what I can find.", "Let me handle that.",
+            "Getting that for you.", "Already on it.", "Say no more.",
+            "Coming right up.", "Let me dig in.", "Taking a look.",
+            "Sure — one sec.", "Mm-hm, on it.", "Okay, let me look.",
+            "Alright, let's do it.",
+        ),
+        "hold": (
+            "One sec — still with you.", "Still on it.", "Almost there.",
+            "Bear with me.", "Just a bit longer.", "Nearly done.",
+            "Still working — hang tight.", "This one's taking a moment.",
+            "Still digging.", "Won't be long.", "Hang on, almost done.",
+            "Give me a few more seconds.", "Still here, still working.",
+            "Just wrapping up.",
+        ),
+        "stop": (
+            "Stopping.", "Okay, stopping.", "Cancelled.", "Stopping now.",
+            "Alright, dropping that.", "Done — stopped.",
+        ),
     }
 
+    # Persistent per-voice clip cache: synthesize once, reuse across restarts.
+    BANK_CACHE = Path.home() / ".neovis" / "cache" / "tts_bank"
+
+    def _bank_path(self, kind: str, line: str) -> Path:
+        import hashlib
+
+        h = hashlib.md5(line.encode()).hexdigest()[:10]
+        return self.BANK_CACHE / self.tts.voice_name / f"{kind}_{h}.wav"
+
     def build_ack_bank(self) -> None:
-        """Pre-synthesize the tiny conversational clips so acknowledgments play
-        in ~50 ms instead of paying TTS synthesis at the moment of use.
-        Rebuilt whenever the voice changes."""
-        bank: dict[str, list] = {}
+        """Make instant clips available NOW (from the disk cache, or by
+        synthesizing one seed per kind), then fill the whole repertoire in the
+        background. Rebuilt whenever the voice changes."""
+        self._bank = {kind: [] for kind in self._BANK_LINES}
+        (self.BANK_CACHE / self.tts.voice_name).mkdir(parents=True, exist_ok=True)
         for kind, lines in self._BANK_LINES.items():
-            clips = []
-            for i, line in enumerate(lines):
-                wav = Path(tempfile.gettempdir()) / f"neovis_bank_{self.tts.voice_name}_{kind}_{i}.wav"
+            for line in lines:  # everything already cached loads instantly
+                wav = self._bank_path(kind, line)
+                if wav.exists():
+                    self._bank[kind].append((line, wav))
+        for kind, lines in self._BANK_LINES.items():
+            if not self._bank[kind]:  # cold cache: seed one clip synchronously
                 try:
-                    if not wav.exists():
-                        self.tts.synthesize(line, wav)
-                    clips.append((line, wav))
+                    wav = self._bank_path(kind, lines[0])
+                    self.tts.synthesize(lines[0], wav)
+                    self._bank[kind].append((lines[0], wav))
                 except Exception:
                     pass
-            bank[kind] = clips
-        self._bank = bank
+        try:  # synthesize the rest without blocking startup
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no running loop (tests / teardown) — seeds are enough
+        loop.create_task(self._fill_bank())
+
+    async def _fill_bank(self) -> None:
+        """Background: synthesize missing clips one at a time on the loop
+        thread (same thread as all other TTS — no races), yielding between."""
+        for kind, lines in self._BANK_LINES.items():
+            for line in lines:
+                wav = self._bank_path(kind, line)
+                if wav.exists():
+                    continue
+                try:
+                    self.tts.synthesize(line, wav)
+                    self._bank.setdefault(kind, []).append((line, wav))
+                except Exception:
+                    return
+                await asyncio.sleep(0.2)  # stay out of the conversation's way
 
     def play_cached(self, kind: str) -> None:
-        """Play a pre-synthesized clip instantly (falls back to live synth)."""
+        """Play a pre-synthesized clip instantly, avoiding recent repeats."""
         import random
+        from collections import deque
 
         clips = self._bank.get(kind) or []
         if not clips:
             line = self._BANK_LINES.get(kind, ("Okay.",))[0]
             self.speak(line, blocking=False)
             return
-        line, wav = random.choice(clips)
+        if not hasattr(self, "_recent_clips"):
+            self._recent_clips = deque(maxlen=8)
+        fresh = [c for c in clips if c[0] not in self._recent_clips] or clips
+        line, wav = random.choice(fresh)
+        self._recent_clips.append(line)
         self._last_spoken = f"{self._last_spoken} {line}"[-400:]  # echo reference
         if not self.speaking:
             self._play_file(wav, blocking=False)
