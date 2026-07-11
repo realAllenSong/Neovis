@@ -30,7 +30,7 @@ from pathlib import Path
 
 MEMORY_DIR = Path.home() / ".neovis" / "memory"
 _DELIM = "§"
-_LIMITS = {"memory": 2400, "user": 1500}
+_LIMITS = {"memory": 3200, "user": 1500}  # memory also holds learned techniques
 _FILES = {"memory": "MEMORY.md", "user": "USER.md"}
 
 # Strip anything that could impersonate our own context framing when replayed
@@ -147,8 +147,13 @@ MEMORY: you have a persistent `memory` tool (targets: "memory" for facts about
 this machine/projects/people, "user" for the user's preferences and habits).
 When the user states a durable fact — a person and their email, a path, a
 convention, a preference ("the CTO is Alice", "always use uv", "reports live in
-~/q2") — save it right away with a short entry; don't ask permission. Consult
-your <memory-context> before asking the user something they already told you.
+~/q2") — save it right away with a short entry; don't ask permission.
+ALSO save TECHNIQUES you discover or the user teaches you: when a method works
+after trial and error ("typing into the Codex app works via AppleScript System
+Events keystrokes", "the WeChat app lives in /Applications"), record the
+method so next time you do it right on the first try. Consult your
+<memory-context> before asking the user something they already told you — and
+before re-deriving a method you already learned.
 Keep entries short; when a store is full, consolidate instead of dropping new
 facts. Never store secrets, passwords, or tokens.
 """

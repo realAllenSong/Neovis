@@ -113,6 +113,10 @@ def _first_sentence(text: str, limit: int = 140) -> str:
     return t[:limit].strip()
 
 
+# Lone thinking noises that should never become a turn.
+_FILLERS = frozenset(
+    "um uh er ah oh hmm hm mm mhm huh like so well".split())
+
 # Trailing words that mean the speaker isn't done ("…check the folder and").
 _TRAILING_CONNECTIVES = (
     "and", "but", "or", "so", "then", "because", "with", "to", "the", "a",
@@ -747,7 +751,11 @@ class VoiceLoop:
 
         from ...voice.vad import VAD
 
-        vad = VAD(sample_rate=samplerate)
+        # threshold 0.3: catch soft first syllables (the default 0.5 swallowed
+        # the user's first word); min_silence 0.7: a mid-sentence thinking
+        # pause no longer chops the utterance. (A/B/C tested — prepending a
+        # pre-roll buffer duplicates words, sherpa segments already pad onset.)
+        vad = VAD(sample_rate=samplerate, threshold=0.3, min_silence=0.7)
         self._speak_blocking = False  # keep the loop alive while Neovis talks
         q: "queue.Queue" = queue.Queue()
 
@@ -824,11 +832,14 @@ class VoiceLoop:
                     if self._is_own_echo(text):
                         print(f"(echo ignored: {text!r})")
                         continue
+                    bare = text.lower().strip(" .,!?…")
+                    if not pend and bare in _FILLERS:
+                        continue  # a lone "um"/"oh" is thinking noise, not input
                     if pend:  # continuation of a held-open thought
                         text = f"{pend} {text}"
                         pend = ""
                     if not _utterance_complete(text):
-                        pend, pend_at = text, _time.time() + 0.9
+                        pend, pend_at = text, _time.time() + 1.4
                         continue
                     # non-blocking: the mic stays live while the turn runs, so
                     # you can keep talking (status, steer, stop) mid-task.

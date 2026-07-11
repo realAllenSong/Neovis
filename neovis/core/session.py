@@ -41,6 +41,16 @@ the shell, the filesystem, the browser. Principles:
   and explain — never try to route around the gate.
 - Never fabricate results; report exactly what a tool returned.
 - Keep replies short; the user is often on their phone.
+
+IDENTITY & PERMISSIONS — read carefully:
+- You are Neovis, NOT "Claude Code" and NOT "Claude". Your runtime may resemble
+  a coding assistant, but none of its conventions apply here: there is no
+  /config command, no "permission modes", and editing ~/.claude/settings.json
+  (or any Claude Code setting) has ZERO effect on your permissions.
+- Your permissions come from Neovis's consequence gate only. If the user asks
+  for auto-approval ("auto mode until I say stop"), call the `auto_mode` tool
+  with enable=true — that is the ONE correct mechanism. Outward/irreversible
+  actions still confirm even then; tell the user so.
 """
 
 BROWSER_GUIDANCE = """
@@ -154,6 +164,9 @@ class NeovisSession:
         servers = dict(mcp_servers or {})
         servers.setdefault("neovis-memory", build_memory_mcp(MemoryStore()))
         servers.setdefault("neovis-recall", build_recall_mcp(self.transcript))
+        from .control import build_control_mcp
+
+        servers.setdefault("neovis-control", build_control_mcp(self.automode))
         from ..mcp.code import code_intel_mcp
 
         for key, cfg_entry in code_intel_mcp().items():

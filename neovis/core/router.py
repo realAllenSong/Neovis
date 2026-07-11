@@ -103,6 +103,18 @@ class IntentRouter:
             # One classification at a time — concurrent queries would interleave
             # turns on the single underlying client.
             async with self._lock:
+                # Judge each message FRESH: a persistent client accumulates
+                # conversation history, which slows Haiku (9 s outliers seen)
+                # and contaminates decisions (an old voice-switch in history
+                # pulls later messages toward "voice"). Recycle every 20 uses.
+                self._uses = getattr(self, "_uses", 0) + 1
+                if self._uses >= 20:
+                    self._uses = 0
+                    try:
+                        await self._client.disconnect()
+                        await self._client.connect()
+                    except Exception:
+                        pass
                 await self._client.query(query)
                 parts: list[str] = []
                 async for msg in self._client.receive_response():

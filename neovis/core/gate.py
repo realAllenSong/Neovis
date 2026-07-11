@@ -128,6 +128,12 @@ def classify(
         return Consequence.READ, "agent memory note (bounded, local)"
     if tool_name.startswith("mcp__neovis-recall__"):
         return Consequence.READ, "searches the user's own conversation history"
+    if tool_name.startswith("mcp__neovis-control__"):
+        # Pinning auto-approval ON relaxes the gate → confirm it once.
+        # Turning it OFF tightens the gate → always free.
+        if tool_input.get("enable"):
+            return Consequence.LOCAL_WRITE, "pins auto-approval ON across tasks (until turned off)"
+        return Consequence.READ, "turns auto-approval off (tightens the gate)"
     if tool_name.startswith("mcp__codebase-memory__"):
         from ..mcp.code import CODE_INTEL_READ_TOOLS
 
@@ -164,15 +170,34 @@ def classify(
 
 @dataclass
 class AutoMode:
-    """Whether we're inside an approved series of local writes. Reset per task."""
+    """Whether local writes run without per-action prompts.
+
+    Two lifetimes:
+    - series (default): enabled by an "approve all (this task)" answer,
+      cleared automatically when the turn ends.
+    - pinned: the user explicitly asked to keep auto-approval ON until they
+      say otherwise ("keep auto mode until I tell you"). Survives turns; only
+      an explicit unpin clears it. OUTWARD actions still always confirm.
+    """
 
     active: bool = False
+    pinned: bool = False
 
     def enable(self) -> None:
         self.active = True
 
-    def reset(self) -> None:
+    def pin(self) -> None:
+        self.active = True
+        self.pinned = True
+
+    def unpin(self) -> None:
         self.active = False
+        self.pinned = False
+
+    def reset(self) -> None:
+        """Per-turn reset — a pinned auto-mode survives it."""
+        if not self.pinned:
+            self.active = False
 
 
 @dataclass
