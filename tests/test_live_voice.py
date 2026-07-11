@@ -49,17 +49,30 @@ def _bare_loop() -> VoiceLoop:
 
 def test_repertoire_is_wide():
     lines = VoiceLoop._BANK_LINES
-    assert len(lines["ack"]) >= 30      # variety sells the illusion
+    all_acks = [l for k, v in lines.items() if k.startswith("ack") for l in v]
+    assert len(all_acks) >= 40          # variety sells the illusion
+    assert len(set(all_acks)) == len(all_acks)  # no duplicates across buckets
     assert len(lines["hold"]) >= 10
-    assert len(set(lines["ack"])) == len(lines["ack"])  # no duplicates
     assert all(len(l.split()) <= 8 for kind in lines.values() for l in kind)
+
+
+def test_ack_bucket_heuristic():
+    b = VoiceLoop._ack_bucket
+    assert b("How many python files are in my repo?") == "ack_look"
+    assert b("Open the quarterly report folder for me") == "ack_do"
+    assert b("Delete the old backups in downloads") == "ack_careful"
+    assert b("Send an email to Alice about the meeting") == "ack_careful"
+    # careful outranks look: mixed intent gets the cautious ack
+    assert b("Check the folder and delete the duplicates") == "ack_careful"
+    assert b("Please summarize everything for me somehow") == "ack"  # no keywords
+    assert b("") == "ack"
 
 
 def test_bank_seeds_all_kinds_instantly(tmp_path, monkeypatch):
     monkeypatch.setattr(VoiceLoop, "BANK_CACHE", tmp_path)
     lp = _bare_loop()
     lp.build_ack_bank()   # no event loop → seeds only, background fill skipped
-    assert set(lp._bank) == {"ack", "hold", "stop"}
+    assert set(lp._bank) == set(VoiceLoop._BANK_LINES)  # every kind + bucket
     for clips in lp._bank.values():
         assert clips and all(Path(w).exists() for _, w in clips)
 

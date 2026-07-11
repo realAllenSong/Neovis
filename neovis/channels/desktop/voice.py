@@ -264,21 +264,36 @@ class VoiceLoop:
 
     # ── instant clips (GPT-Live-style acknowledgments) ────────────────────────
     # A wide, rotating repertoire: one canned "On it." repeated forever breaks
-    # the illusion; fifty task-neutral variations, never repeating recently,
+    # the illusion; dozens of task-neutral variations, never repeating recently,
     # read as a butler improvising — at ~50 ms, because they're all canned.
+    # Acks are BUCKETED by request type (picked by a 0 ms keyword heuristic, so
+    # instantness is preserved): queries get "Let me check.", actions get
+    # "Consider it done.", destructive/outward requests get "Okay — carefully."
     _BANK_LINES = {
         "ack": (
-            "On it.", "Sure.", "Sure thing.", "Right away.", "Absolutely.",
-            "Of course.", "You got it.", "Consider it done.", "Happy to.",
-            "Okay, on it.", "Let me take a look.", "Looking into it now.",
-            "Let me check.", "Checking now.", "Let's see.", "Give me a moment.",
-            "One moment.", "Just a moment.", "Working on it.", "Getting to it.",
-            "On the case.", "Right, checking now.", "Alright, one sec.",
-            "Leave it to me.", "Let me see what I can find.", "Let me handle that.",
-            "Getting that for you.", "Already on it.", "Say no more.",
-            "Coming right up.", "Let me dig in.", "Taking a look.",
-            "Sure — one sec.", "Mm-hm, on it.", "Okay, let me look.",
-            "Alright, let's do it.",
+            "On it.", "Sure.", "Sure thing.", "Absolutely.", "Of course.",
+            "Happy to.", "Okay, on it.", "Give me a moment.", "One moment.",
+            "Just a moment.", "Working on it.", "Getting to it.",
+            "On the case.", "Alright, one sec.", "Already on it.",
+            "Sure — one sec.", "Mm-hm, on it.",
+        ),
+        "ack_look": (
+            "Let me check.", "Checking now.", "Let me take a look.",
+            "Let's see.", "Looking into it now.", "Let me see what I can find.",
+            "Taking a look.", "Okay, let me look.", "Let me dig in.",
+            "Right, checking now.", "One moment — checking.", "Let me find out.",
+        ),
+        "ack_do": (
+            "Consider it done.", "Right away.", "You got it.",
+            "Coming right up.", "Say no more.", "Leave it to me.",
+            "Let me handle that.", "Getting that for you.",
+            "Alright, let's do it.", "Done and done — one sec.",
+        ),
+        "ack_careful": (
+            "Okay — carefully.", "Sure — I'll be careful.",
+            "On it — with care.", "Alright, double-checking as I go.",
+            "Okay. I'll confirm before anything final.",
+            "Careful mode — on it.",
         ),
         "hold": (
             "One sec — still with you.", "Still on it.", "Almost there.",
@@ -293,6 +308,29 @@ class VoiceLoop:
             "Alright, dropping that.", "Done — stopped.",
         ),
     }
+
+    # Request-type keywords for the 0 ms bucket pick. Careful wins over look
+    # wins over do ("check the folder and delete it" deserves caution).
+    _CAREFUL_WORDS = frozenset(
+        "delete remove erase wipe drop kill uninstall overwrite destroy rm "
+        "send email submit post publish push pay purchase buy deploy".split())
+    _LOOK_WORDS = frozenset(
+        "what when where who which why how check find search look show "
+        "list count read tell is are does do did any status".split())
+    _DO_WORDS = frozenset(
+        "open create make move copy rename write run start launch install "
+        "organize set change update download save build fix close".split())
+
+    @classmethod
+    def _ack_bucket(cls, text: str) -> str:
+        words = {w.strip(".,!?;:'\"").lower() for w in (text or "").split()}
+        if words & cls._CAREFUL_WORDS:
+            return "ack_careful"
+        if words & cls._LOOK_WORDS:
+            return "ack_look"
+        if words & cls._DO_WORDS:
+            return "ack_do"
+        return "ack"
 
     # Persistent per-voice clip cache: synthesize once, reuse across restarts.
     BANK_CACHE = Path.home() / ".neovis" / "cache" / "tts_bank"
@@ -349,6 +387,8 @@ class VoiceLoop:
         from collections import deque
 
         clips = self._bank.get(kind) or []
+        if not clips and kind.startswith("ack_"):
+            clips = self._bank.get("ack") or []  # bucket cold → generic acks
         if not clips:
             line = self._BANK_LINES.get(kind, ("Okay.",))[0]
             self.speak(line, blocking=False)
@@ -424,7 +464,7 @@ class VoiceLoop:
                     "thanks", "thank", "ok", "okay", "cool", "nice", "great",
                     "perfect", "awesome", "good", "hey", "hi", "hello")
                 if len(words) >= 4 and not social:
-                    self.play_cached("ack")   # pre-synthesized: ~50 ms
+                    self.play_cached(self._ack_bucket(text))  # ~50 ms, typed
                     trace.mark("ack")
                 send_task = asyncio.ensure_future(self._run_task(text))
             intent = await self.router.classify(text)
