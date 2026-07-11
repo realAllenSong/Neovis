@@ -9,7 +9,10 @@
 
 llm:
   provider: anthropic          # anthropic | openai (openai covers any OpenAI-compatible proxy)
-  model: claude-sonnet-4-5
+  # The EXECUTION brain (the Haiku router/curator tiers are fixed in code).
+  # claude-sonnet-5 = best speed/capability balance for interactive control;
+  # claude-opus-4-8 = maximum capability (slower; consider for demo day).
+  model: claude-sonnet-5
   base_url:                    # e.g. https://llm-proxy.yourfund.internal/v1  (blank = provider default)
   api_key_env: NEOVIS_API_KEY
 
