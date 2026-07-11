@@ -69,6 +69,42 @@ def test_persists_across_instances(tmp_path):
     assert "Shanghai" in store(tmp_path).entries("user")[0]
 
 
+def test_replace_archives_the_old_version(tmp_path):
+    s = store(tmp_path)
+    s.add("memory", "deploys run from ~/old/path")
+    s.replace("memory", "~/old/path", "deploys run from ~/new/path")
+    r = s.search("old path deploys")
+    archived = [h for h in r["hits"] if h["where"] == "archived"]
+    assert archived and "~/old/path" in archived[0]["entry"]
+    assert archived[0]["when"]  # dated
+
+
+def test_remove_archives_and_stays_searchable(tmp_path):
+    s = store(tmp_path)
+    s.add("user", "used to prefer replies in English")
+    s.remove("user", "prefer replies in English")
+    assert s.entries("user") == []          # hot tier clean
+    r = s.search("English replies")
+    assert any(h["where"] == "archived" and h["target"] == "user" for h in r["hits"])
+
+
+def test_search_covers_live_and_archived(tmp_path):
+    s = store(tmp_path)
+    s.add("memory", "CTO is Alice Zhang")
+    s.add("memory", "old ticker watch: NVDA")
+    s.remove("memory", "old ticker")
+    r = s.search("Alice NVDA")
+    wheres = {h["where"] for h in r["hits"]}
+    assert wheres == {"live", "archived"}
+
+
+def test_search_empty_and_miss(tmp_path):
+    s = store(tmp_path)
+    assert not s.search("")["ok"]
+    r = s.search("zebra")
+    assert r["ok"] and r["hits"] == [] and "zebra" in r["note"]
+
+
 def test_gate_classifies_memory_as_read():
     tier, why = classify("mcp__neovis-memory__memory",
                          {"action": "add", "target": "memory", "content": "x"},

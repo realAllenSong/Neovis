@@ -26,6 +26,8 @@ in-process MCP server on every session; the gate classifies it READ-tier
 from __future__ import annotations
 
 import re
+import sqlite3
+import time
 from pathlib import Path
 
 MEMORY_DIR = Path.home() / ".neovis" / "memory"
@@ -43,11 +45,62 @@ def _sanitize(text: str) -> str:
 
 
 class MemoryStore:
-    """Bounded, file-backed, two-target memory (``memory`` / ``user``)."""
+    """Two-tier memory.
+
+    HOT tier: bounded, human-readable MEMORY.md / USER.md — small on purpose,
+    because every session injects it into the system prompt. COLD tier: an
+    unbounded SQLite FTS archive (archive.db) that receives every entry the
+    hot tier replaces or removes, searchable via the memory tool's `search`
+    action — so consolidating boldly never loses anything."""
 
     def __init__(self, base_dir: str | Path = MEMORY_DIR):
         self.base = Path(base_dir)
         self.base.mkdir(parents=True, exist_ok=True)
+
+    # ── cold tier ─────────────────────────────────────────────────────────────
+    def _archive_conn(self) -> sqlite3.Connection:
+        c = sqlite3.connect(self.base / "archive.db")
+        c.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS archive "
+            "USING fts5(content, target UNINDEXED, ts UNINDEXED)"
+        )
+        return c
+
+    def _archive(self, target: str, text: str) -> None:
+        try:
+            with self._archive_conn() as c:
+                c.execute("INSERT INTO archive (content, target, ts) VALUES (?,?,?)",
+                          (text, target, time.time()))
+        except Exception:
+            pass  # archiving is best-effort; never block a memory operation
+
+    def search(self, query: str, limit: int = 6) -> dict:
+        """Search live entries AND the archive — long-tail recall."""
+        from datetime import datetime
+
+        words = re.findall(r"\w+", query or "")[:12]
+        if not words:
+            return {"ok": False, "error": "empty query"}
+        lows = [w.lower() for w in words]
+        hits: list[dict] = []
+        for target in _FILES:
+            for e in self.entries(target):
+                if any(w in e.lower() for w in lows):
+                    hits.append({"where": "live", "target": target, "entry": e})
+        try:
+            match = " OR ".join(f'"{w}"' for w in words)
+            with self._archive_conn() as c:
+                rows = c.execute(
+                    "SELECT content, target, ts FROM archive WHERE archive MATCH ? "
+                    "ORDER BY rank LIMIT ?", (match, limit)).fetchall()
+            for content, target, ts in rows:
+                hits.append({"where": "archived", "target": target, "entry": content,
+                             "when": datetime.fromtimestamp(ts).strftime("%Y-%m-%d")})
+        except Exception:
+            pass
+        if not hits:
+            return {"ok": True, "hits": [], "note": f"nothing stored matches {query!r}"}
+        return {"ok": True, "hits": hits[: limit + 4]}
 
     def _path(self, target: str) -> Path:
         return self.base / _FILES[target]
@@ -80,7 +133,8 @@ class MemoryStore:
                 "ok": False,
                 "error": f"{_FILES[target]} is full ({self._chars(entries)}/{limit} chars). "
                          "Consolidate first: merge or drop stale entries with "
-                         "replace/remove, then add.",
+                         "replace/remove — removed entries are archived and stay "
+                         "searchable via the search action — then add.",
                 "entries": entries,
             }
         entries.append(content)
@@ -106,6 +160,7 @@ class MemoryStore:
         others = self._chars(entries) - len(entries[idx])
         if others + len(content) > _LIMITS[target]:
             return {"ok": False, "error": "replacement would exceed the limit — shorten it"}
+        self._archive(target, entries[idx])  # cold tier keeps the old version
         entries[idx] = content
         self._save(target, entries)
         return {"ok": True, "count": len(entries), "chars": self._chars(entries)}
@@ -116,6 +171,7 @@ class MemoryStore:
         if idx is None:
             return {"ok": False, "error": err}
         dropped = entries.pop(idx)
+        self._archive(target, dropped)  # cold tier keeps it, searchable forever
         self._save(target, entries)
         return {"ok": True, "removed": dropped[:60], "count": len(entries)}
 
@@ -154,21 +210,26 @@ Events keystrokes", "the WeChat app lives in /Applications"), record the
 method so next time you do it right on the first try. Consult your
 <memory-context> before asking the user something they already told you — and
 before re-deriving a method you already learned.
-Keep entries short; when a store is full, consolidate instead of dropping new
-facts. Never store secrets, passwords, or tokens.
+Keep entries short; when a store is full, consolidate BOLDLY — anything you
+replace or remove is archived forever and findable with the memory tool's
+`search` action, so nothing is ever truly lost. If you don't see a fact in
+<memory-context>, search before saying you don't know it.
+Never store secrets, passwords, or tokens.
 """
 
 _MEMORY_SCHEMA = {
     "type": "object",
     "properties": {
-        "action": {"type": "string", "enum": ["add", "replace", "remove"]},
+        "action": {"type": "string", "enum": ["add", "replace", "remove", "search"]},
         "target": {"type": "string", "enum": ["memory", "user"],
-                   "description": "'memory' = machine/project/people facts; 'user' = the user themself"},
+                   "description": "'memory' = machine/project/people facts; 'user' = the user themself (ignored for search)"},
         "content": {"type": "string", "description": "the entry text (add/replace)"},
         "old_text": {"type": "string",
                      "description": "short UNIQUE substring of the entry to replace/remove"},
+        "query": {"type": "string",
+                  "description": "words to look up (search) — covers live notes AND everything ever archived"},
     },
-    "required": ["action", "target"],
+    "required": ["action"],
 }
 
 
@@ -178,9 +239,10 @@ def build_memory_mcp(store: MemoryStore):
 
     @tool(
         "memory",
-        "Persist a durable fact across sessions (add), update one (replace), or "
-        "drop a stale one (remove). Saved notes are shown to you at the start of "
-        "every future session.",
+        "Persist a durable fact across sessions (add), update one (replace), "
+        "drop a stale one (remove), or look something up (search — covers live "
+        "notes AND every entry ever archived). Saved notes are shown to you at "
+        "the start of every future session.",
         _MEMORY_SCHEMA,
     )
     async def memory(args: dict) -> dict:
@@ -188,8 +250,10 @@ def build_memory_mcp(store: MemoryStore):
 
         action = args.get("action", "")
         target = args.get("target", "memory")
-        if target not in _FILES:
-            result: dict = {"ok": False, "error": f"unknown target {target!r}"}
+        if action == "search":
+            result: dict = store.search(args.get("query", ""))
+        elif target not in _FILES:
+            result = {"ok": False, "error": f"unknown target {target!r}"}
         elif action == "add":
             result = store.add(target, args.get("content", ""))
         elif action == "replace":
