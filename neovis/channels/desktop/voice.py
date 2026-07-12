@@ -125,9 +125,14 @@ _TRAILING_CONNECTIVES = (
 
 
 def _utterance_complete(text: str) -> bool:
-    """Endpointing heuristic: does this transcript look like a finished
-    thought? If not, the mic loop holds ~0.9 s for a continuation and merges
-    (GPT-Live 'waits instead of jumping into pauses')."""
+    """Endpointing: does this transcript look like a finished thought? Only a
+    genuinely dangling one is held (briefly) for a continuation.
+
+    Dead air is the enemy: requiring terminal punctuation used to stall EVERY
+    unpunctuated sentence for the full merge window on top of the VAD's silence
+    wait. Now we hold only when the speaker clearly isn't done — trailing
+    connective ("...the folder and"), or a short unpunctuated fragment.
+    """
     t = (text or "").strip()
     if not t:
         return False
@@ -137,7 +142,9 @@ def _utterance_complete(text: str) -> bool:
     last = words[-1].lower().strip(".,!?;:")
     if last in _TRAILING_CONNECTIVES:
         return False
-    return t[-1] in ".!?"
+    if t[-1] in ".!?":
+        return True
+    return len(words) >= 5  # a long unpunctuated sentence is a finished thought
 
 
 _VOICE_STEER_NOTE = (
@@ -218,53 +225,119 @@ class VoiceLoop:
         self.router = router  # IntentRouter (Haiku) or None → rule fallback
         self.ui = ui or VoiceUI()
         self._wav = Path(tempfile.gettempdir()) / "neovis_say.wav"
-        self._playing = None          # subprocess.Popen while speaking (barge-in)
-        self._speak_blocking = True   # hands-free flips this so we keep listening
+        self._proc = None             # the asyncio subprocess currently playing
+        self._speaking_item = None    # item being synthesized or played
+        self._speech_q: asyncio.Queue = asyncio.Queue()
+        self._speaker_task: asyncio.Task | None = None
+        self._tts_lock = asyncio.Lock()
         self._last_spoken = ""        # for echo detection (hearing ourselves)
         self._speak_end = 0.0         # when playback last stopped
         self._narrated = ""           # last interim line narrated aloud
-        self._narrated_played = False  # whether that line actually got voiced
         self._trace: _Trace | None = None
         self.last_asr_s: float | None = None
         self._bank: dict[str, list] = {}   # pre-synthesized instant clips
         self._turn_task: asyncio.Task | None = None  # the in-flight agent turn
         self._busy_reply = False      # one while-busy exchange at a time
 
+    # ── the speech queue ─────────────────────────────────────────────────────
+    # ONE serial player owns the speaker. Everything that wants to talk (cached
+    # ack, narration, keep-alive, the final answer) enqueues; the player
+    # synthesizes, reveals the text at the instant audio starts, and plays to
+    # completion before touching the next item. Consequences, all of which the
+    # user asked for by name:
+    #   • clips can never overlap — a started sentence always finishes
+    #   • text and audio land together (never text first)
+    #   • only a HUMAN interrupt clears the queue (stop_speaking)
     def _synth(self, text: str) -> Path:
-        """Synthesize to a fresh wav (no reuse races between ack/narration/reply)."""
+        """Synthesize to a fresh wav (no reuse races between clips)."""
         self._wav_seq = getattr(self, "_wav_seq", 0) + 1
         wav = Path(tempfile.gettempdir()) / f"neovis_say_{self._wav_seq % 8}.wav"
-        self._last_spoken = f"{self._last_spoken} {text}"[-400:]  # echo reference
         self.tts.synthesize(text, wav)
         self._wav = wav  # last spoken clip (tests/tools peek at it)
         return wav
 
-    def _play_file(self, wav: Path, *, blocking: bool) -> None:
-        import time as _time
-
-        cmd = _play_cmd(str(wav))
-        if cmd is None:
-            _play(str(wav))           # blocking fallback (e.g. Windows winsound)
-            self._speak_end = _time.time()
+    def enqueue(self, *, text: str = "", wav: Path | None = None,
+                on_start=None, kind: str = "say") -> None:
+        """Queue one utterance. Never blocks, never overlaps, never pre-empts."""
+        if not text and wav is None:
             return
-        if blocking:
-            subprocess.run(cmd)
-            self._speak_end = _time.time()
-        else:
-            self._playing = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # The echo filter must know what we're ABOUT to say the moment it's
+        # queued — the mic may capture the tail of a clip while the next is
+        # still pending.
+        if text:
+            self._last_spoken = f"{self._last_spoken} {text}"[-400:]
+        self._speech_q.put_nowait(
+            {"text": text, "wav": wav, "on_start": on_start, "kind": kind})
 
     def speak(self, text: str, *, blocking: bool | None = None) -> None:
-        if blocking is None:
-            blocking = self._speak_blocking
-        self._play_file(self._synth(text), blocking=blocking)
+        """Back-compat shim: everything goes through the queue now."""
+        self.enqueue(text=text)
 
-    async def _wait_quiet(self, timeout: float = 8.0) -> None:
-        """Let any in-flight (non-blocking) speech finish before the next clip."""
+    def drop_pending(self, kind: str) -> None:
+        """Discard queued (not yet started) clips of a kind — e.g. a stale
+        'still with you' once the real answer is ready to speak."""
+        kept = []
+        while not self._speech_q.empty():
+            item = self._speech_q.get_nowait()
+            self._speech_q.task_done()
+            if item.get("kind") != kind:
+                kept.append(item)
+        for item in kept:
+            self._speech_q.put_nowait(item)
+
+    async def _speaker_loop(self) -> None:
+        """The single consumer of the speech queue."""
+        import time as _time
+
+        while True:
+            item = await self._speech_q.get()
+            self._speaking_item = item   # busy from here, before the wav exists
+            try:
+                wav = item.get("wav")
+                if wav is None:
+                    # Synthesis off the event loop, serialized against the
+                    # background bank fill (sherpa TTS is not re-entrant).
+                    async with self._tts_lock:
+                        wav = await asyncio.to_thread(self._synth, item["text"])
+                if item.get("on_start"):
+                    try:
+                        item["on_start"]()       # text appears AS audio starts
+                    except Exception:
+                        pass
+                cmd = _play_cmd(str(wav))
+                if cmd is None:
+                    await asyncio.to_thread(_play, str(wav))
+                else:
+                    self._proc = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL)
+                    await self._proc.wait()      # play to completion
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print("speech error:", exc)
+            finally:
+                self._proc = None
+                self._speaking_item = None
+                self._speak_end = _time.time()
+                self._speech_q.task_done()
+
+    @property
+    def voice_busy(self) -> bool:
+        """Speaking, about to speak, or synthesizing. `speaking` alone has a
+        blind spot: between taking an item and spawning the player there is a
+        synthesis window where no process exists yet and the queue is already
+        empty — anything checking for silence there gets a false 'idle'."""
+        return (self._speaking_item is not None or self.speaking
+                or not self._speech_q.empty())
+
+    async def wait_until_quiet(self, timeout: float = 30.0) -> None:
+        """Block until the queue is drained and the speaker is truly silent."""
         import time as _time
 
         t0 = _time.time()
-        while self.speaking and _time.time() - t0 < timeout:
-            await asyncio.sleep(0.08)
+        while self.voice_busy and _time.time() - t0 < timeout:
+            await asyncio.sleep(0.05)
 
     # ── instant clips (GPT-Live-style acknowledgments) ────────────────────────
     # A wide, rotating repertoire: one canned "On it." repeated forever breaks
@@ -379,14 +452,17 @@ class VoiceLoop:
                 if wav.exists():
                     continue
                 try:
-                    self.tts.synthesize(line, wav)
+                    # Same lock the speaker uses — sherpa TTS is not re-entrant.
+                    async with self._tts_lock:
+                        await asyncio.to_thread(self.tts.synthesize, line, wav)
                     self._bank.setdefault(kind, []).append((line, wav))
                 except Exception:
                     return
                 await asyncio.sleep(0.2)  # stay out of the conversation's way
 
-    def play_cached(self, kind: str) -> None:
-        """Play a pre-synthesized clip instantly, avoiding recent repeats."""
+    def play_cached(self, kind: str, on_start=None) -> None:
+        """Queue a pre-synthesized clip (no synthesis latency), avoiding recent
+        repeats. Like every other clip it waits its turn — never overlaps."""
         import random
         from collections import deque
 
@@ -394,34 +470,33 @@ class VoiceLoop:
         if not clips and kind.startswith("ack_"):
             clips = self._bank.get("ack") or []  # bucket cold → generic acks
         if not clips:
-            line = self._BANK_LINES.get(kind, ("Okay.",))[0]
-            self.speak(line, blocking=False)
+            self.enqueue(text=self._BANK_LINES.get(kind, ("Okay.",))[0],
+                         on_start=on_start, kind=kind)
             return
         if not hasattr(self, "_recent_clips"):
             self._recent_clips = deque(maxlen=8)
         fresh = [c for c in clips if c[0] not in self._recent_clips] or clips
         line, wav = random.choice(fresh)
         self._recent_clips.append(line)
-        self._last_spoken = f"{self._last_spoken} {line}"[-400:]  # echo reference
-        if not self.speaking:
-            self._play_file(wav, blocking=False)
+        self.enqueue(text=line, wav=wav, on_start=on_start, kind=kind)
 
     @property
     def speaking(self) -> bool:
-        import time as _time
-
-        alive = self._playing is not None and self._playing.poll() is None
-        if not alive and self._playing is not None:
-            self._playing = None
-            self._speak_end = _time.time()
-        return alive
+        return self._proc is not None and self._proc.returncode is None
 
     def stop_speaking(self) -> None:
+        """HUMAN interrupt only: kill the current clip and drop what's queued.
+        Nothing inside Neovis ever calls this to make room for itself."""
         import time as _time
 
-        if self._playing is not None and self._playing.poll() is None:
-            self._playing.terminate()
-        self._playing = None
+        if self._proc is not None and self._proc.returncode is None:
+            try:
+                self._proc.terminate()
+            except ProcessLookupError:
+                pass
+        while not self._speech_q.empty():
+            self._speech_q.get_nowait()
+            self._speech_q.task_done()
         self._speak_end = _time.time()
 
     def _is_own_echo(self, text: str) -> bool:
@@ -485,8 +560,8 @@ class VoiceLoop:
                 await asyncio.gather(send_task, return_exceptions=True)
 
         if action == "stop":
-            self.ui.response("Stopping.", "")
-            self.play_cached("stop")
+            self.stop_speaking()  # a stop request IS a human interrupt
+            self.play_cached("stop", on_start=lambda: self.ui.response("Stopping.", ""))
             self.session.stop()
             await unwind()
             trace.done()
@@ -501,10 +576,8 @@ class VoiceLoop:
             # Pure small talk: Haiku already wrote the line — speak it now
             # (~2-3 s total) instead of a 10 s main-model turn on "hey".
             line = str(intent.get("reply") or "Hey — what can I do for you?")
-            wav = self._synth(line)
-            self.ui.response(line, "")          # text and audio land together
+            self.enqueue(text=line, on_start=lambda: self.ui.response(line, ""))
             trace.mark("spoken")
-            self._play_file(wav, blocking=self._speak_blocking)
             await unwind()
             trace.done()
             return line
@@ -518,14 +591,12 @@ class VoiceLoop:
             # Narration IS the speech: the last streamed line is the answer
             # line; the panel shows the whole story (each stage + result).
             spoken, detail = self._narrated, reply.strip()
-        if self._narrated and self._narrated_played:
-            self.ui.response(spoken, detail)    # already heard it — just show
+            self.ui.response(spoken, detail)   # already queued as narration
         else:
-            await self._wait_quiet()            # let a narration clip finish
-            wav = self._synth(spoken)
-            self.ui.response(spoken, detail)    # text and audio land together
+            self.enqueue(text=spoken,
+                         on_start=lambda: self.ui.response(spoken, detail))
             trace.mark("spoken")
-            self._play_file(wav, blocking=self._speak_blocking)
+        self.drop_pending("hold")   # the answer is in — no stale "still with you"
         trace.done(narrated=bool(self._narrated))
         return reply
 
@@ -570,16 +641,14 @@ class VoiceLoop:
                 return
             if action == "chat":
                 line = str(intent.get("reply") or "Still here — working on it.")
-                await self._wait_quiet(3)
-                self.ui.response(line, "")
-                self.speak(line, blocking=False)
+                self.enqueue(text=line, on_start=lambda: self.ui.response(line, ""))
                 return
             if action == "voice":
                 self._switch_voice(intent.get("name"), intent.get("accent"), intent.get("gender"))
                 return
             # a new/changed request → voice steer
             self.ui.thinking(f"redirect: {text[:44]}")
-            self.speak("Okay, switching to that.", blocking=False)
+            self.enqueue(text="Okay, switching to that.")
             self.session.stop()
             old = self._turn_task
             self._turn_task = None
@@ -592,19 +661,21 @@ class VoiceLoop:
 
     def _narrate(self, block_text: str) -> None:
         """Speak the model's interim commentary as it streams ('Checking the
-        repository now.') so working time is narrated, not silent."""
+        repository now.') so working time is narrated, not silent. Queued like
+        everything else — it waits for the ack to finish, never talks over it."""
         line = _first_sentence(block_text)
         if not line:
             return
         self._narrated = line
-        self._narrated_played = False
         if self._trace is not None and "first_voice_s" not in self._trace.d:
             self._trace.mark("first_voice")
-        self.ui.step(line[:64])
-        if self.speaking:
-            return  # never overlap clips; the capsule still shows the line
-        self._play_file(self._synth(line), blocking=False)
-        self._narrated_played = True
+        # Freshness without interruption: a line that hasn't STARTED yet is
+        # superseded by this newer one (no point saying "checking…" once the
+        # result is known). A line already being spoken always finishes.
+        self.drop_pending("hold")
+        self.drop_pending("narrate")
+        self.enqueue(text=line, on_start=lambda: self.ui.step(line[:64]),
+                     kind="narrate")
 
     async def _run_task(self, text: str) -> str:
         # GPT-Live-style keep-alive: if the engine goes quiet for ~9 s with no
@@ -615,7 +686,9 @@ class VoiceLoop:
         async def keepalive():
             for _ in range(2):
                 await asyncio.sleep(9)
-                if not self.speaking and _time.time() - self._speak_end > 6:
+                # Only when genuinely silent — a keep-alive must never pile up
+                # behind (or interleave with) real speech.
+                if not self.voice_busy and _time.time() - self._speak_end > 6:
                     self.play_cached("hold")
 
         ka = asyncio.create_task(keepalive())
@@ -751,12 +824,12 @@ class VoiceLoop:
 
         from ...voice.vad import VAD
 
-        # threshold 0.3: catch soft first syllables (the default 0.5 swallowed
-        # the user's first word); min_silence 0.7: a mid-sentence thinking
-        # pause no longer chops the utterance. (A/B/C tested — prepending a
-        # pre-roll buffer duplicates words, sherpa segments already pad onset.)
-        vad = VAD(sample_rate=samplerate, threshold=0.3, min_silence=0.7)
-        self._speak_blocking = False  # keep the loop alive while Neovis talks
+        # threshold 0.3: catch soft first syllables (0.5 swallowed the user's
+        # first word). min_silence 0.5: long enough that a brief mid-sentence
+        # pause doesn't chop the utterance, short enough that finishing a
+        # sentence doesn't feel like waiting (0.7 read as "several seconds"
+        # once the continuation window stacked on top).
+        vad = VAD(sample_rate=samplerate, threshold=0.3, min_silence=0.5)
         q: "queue.Queue" = queue.Queue()
 
         def audio_cb(indata, _n, _t, _s):
@@ -839,7 +912,7 @@ class VoiceLoop:
                         text = f"{pend} {text}"
                         pend = ""
                     if not _utterance_complete(text):
-                        pend, pend_at = text, _time.time() + 1.4
+                        pend, pend_at = text, _time.time() + 0.7
                         continue
                     # non-blocking: the mic stays live while the turn runs, so
                     # you can keep talking (status, steer, stop) mid-task.
@@ -893,11 +966,14 @@ async def build_voice_loop(*, voice="sky", hotwords=None, audit_db="neovis_audit
     router = IntentRouter()
     await router.connect()
     loop = VoiceLoop(session, asr, tts, router=router, ui=ui)
+    loop._speaker_task = asyncio.create_task(loop._speaker_loop())  # the one voice
     loop.build_ack_bank()  # instant acknowledgment clips, ready before turn 1
 
     async def cleanup():
         if loop._turn_task is not None:
             loop._turn_task.cancel()
+        if loop._speaker_task is not None:
+            loop._speaker_task.cancel()
         await manager.stop()
         await router.disconnect()
         await session.disconnect()

@@ -16,11 +16,18 @@ def test_finished_thoughts_dispatch():
 
 
 def test_mid_thought_holds():
+    # Only genuinely dangling fragments are held — dead air is the enemy.
     assert not _utterance_complete("Check the downloads folder and")
     assert not _utterance_complete("I want you to open, um")
     assert not _utterance_complete("Take a screenshot of the")
-    assert not _utterance_complete("Email the report to")           # no terminal punct
-    assert not _utterance_complete("Move the files into the folder")  # trails off
+    assert not _utterance_complete("Email the report to")     # trailing preposition
+    assert not _utterance_complete("Open the file")           # short, unpunctuated
+
+
+def test_long_unpunctuated_sentence_dispatches():
+    # ASR often omits the final period; a finished long thought must not stall.
+    assert _utterance_complete("Move the files into the archive folder please")
+    assert _utterance_complete("Count how many python files are in my repo")
 
 
 def test_empty_is_incomplete():
@@ -38,12 +45,16 @@ class _StubTTS:
 
 
 def _bare_loop() -> VoiceLoop:
+    import asyncio
+
     lp = VoiceLoop.__new__(VoiceLoop)
     lp.tts = _StubTTS()
     lp._bank = {}
     lp._last_spoken = ""
-    lp._playing = None
+    lp._proc = None
+    lp._speaking_item = None
     lp._speak_end = 0.0
+    lp._speech_q = asyncio.Queue()
     return lp
 
 
@@ -88,7 +99,7 @@ def test_bank_reloads_from_disk_cache(tmp_path, monkeypatch):
     assert all(lp._bank[k] for k in lp._bank)
 
 
-def test_play_cached_avoids_recent_repeats_and_marks_echo(tmp_path, monkeypatch):
+def test_play_cached_queues_without_repeats_and_marks_echo(tmp_path, monkeypatch):
     monkeypatch.setattr(VoiceLoop, "BANK_CACHE", tmp_path)
     lp = _bare_loop()
     # pre-populate the full stop repertoire so rotation has room
@@ -97,12 +108,37 @@ def test_play_cached_avoids_recent_repeats_and_marks_echo(tmp_path, monkeypatch)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"RIFF0000WAVE")
     lp.build_ack_bank()
-    lp._play_file = lambda wav, blocking: None  # don't actually play
-    played = []
     for _ in range(6):
-        before = lp._last_spoken
         lp.play_cached("stop")
-        played.append(lp._last_spoken[len(before):].strip())
-    assert len(set(played)) == len(played)  # 6 clips available → no repeat
-    assert any("topp" in p or "ancel" in p or "ropping" in p for p in played)
-    assert lp._last_spoken  # echo filter knows what we said
+    queued = [lp._speech_q.get_nowait()["text"] for _ in range(6)]
+    assert len(set(queued)) == len(queued)  # 6 clips available → no repeat
+    assert all(t in VoiceLoop._BANK_LINES["stop"] for t in queued)
+    for t in queued:                        # echo filter knows what we'll say
+        assert t in lp._last_spoken or lp._last_spoken.endswith(t)
+
+
+def test_speech_queue_never_overlaps_and_drops_stale_holds(tmp_path, monkeypatch):
+    """The queue is the whole anti-overlap guarantee: enqueueing NEVER plays,
+    and a stale keep-alive can be dropped before it ever reaches the speaker."""
+    monkeypatch.setattr(VoiceLoop, "BANK_CACHE", tmp_path)
+    lp = _bare_loop()
+    lp.build_ack_bank()
+    lp.enqueue(text="First line.")
+    lp.play_cached("hold")
+    lp.enqueue(text="The real answer.")
+    assert lp._speech_q.qsize() == 3
+    assert not lp.speaking            # queueing alone never starts audio
+
+    lp.drop_pending("hold")           # answer is ready → stale filler removed
+    remaining = [lp._speech_q.get_nowait() for _ in range(lp._speech_q.qsize())]
+    assert [r["text"] for r in remaining] == ["First line.", "The real answer."]
+
+
+def test_stop_speaking_clears_the_queue(tmp_path, monkeypatch):
+    """Human interrupt: drop everything pending, not just the current clip."""
+    monkeypatch.setattr(VoiceLoop, "BANK_CACHE", tmp_path)
+    lp = _bare_loop()
+    lp.enqueue(text="one")
+    lp.enqueue(text="two")
+    lp.stop_speaking()
+    assert lp._speech_q.empty()

@@ -10,7 +10,8 @@ from neovis.channels.desktop.voice import VoiceLoop
 def make_loop() -> VoiceLoop:
     # No session/asr/tts needed for echo logic — bypass __init__.
     loop = VoiceLoop.__new__(VoiceLoop)
-    loop._playing = None
+    loop._proc = None
+    loop._speaking_item = None
     loop._last_spoken = ""
     loop._speak_end = 0.0
     return loop

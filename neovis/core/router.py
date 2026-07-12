@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -41,7 +42,9 @@ Choose "action":
   you do, how are you, banter). Also fill:
     "reply": a short, warm, JARVIS-butler-style response (max 20 words, no markdown)
   NOT chat if it needs the machine (files, apps, screen, status of anything),
-  or mixes in a request ("hey, open chrome") — those are "task".
+  or mixes in a request ("hey, open chrome") — those are "task". Anything about
+  PERMISSIONS or auto-approval ("just approve everything from now on") is a
+  "task": it needs a tool call, not a friendly agreement.
 - "task" — anything else: a request for the agent to DO something on the computer.
 
 If the message is preceded by "[note: a task is currently running]", the user
@@ -137,6 +140,20 @@ class IntentRouter:
 
 _STOP_WORDS = ("stop", "/stop", "cancel", "abort", "nevermind", "never mind", "cut it out")
 
+# Permission requests SOUND conversational ("just approve everything from now
+# on") and Haiku used to file them as small talk — so Neovis would cheerfully
+# agree and change nothing, because only the `auto_mode` TOOL actually moves
+# the gate. Force them down the task path.
+_AUTO_MODE_RX = re.compile(
+    r"\b(auto[\s-]?(mode|approv\w*)"
+    r"|approve\s+(everything|all|them all|it all)"
+    r"|stop\s+asking(\s+me)?"
+    r"|(don'?t|do not|no need to)\s+ask(\s+me)?(\s+again|\s+any\s?more|\s+every\s+time)?"
+    r"|without\s+asking"
+    r"|permission\s+mode)\b",
+    re.I,
+)
+
 
 def _fast_rules(text: str) -> dict | None:
     """Tier 0: return a confident classification for obvious commands, else None
@@ -145,6 +162,8 @@ def _fast_rules(text: str) -> dict | None:
 
     if text.strip().lower() in _STOP_WORDS:
         return {"action": "stop"}
+    if _AUTO_MODE_RX.search(text or ""):
+        return {"action": "task"}  # needs the auto_mode tool, not a chat reply
     intent = parse_voice_command(text)
     if intent is not None and intent.specified:  # an explicit voice request
         return {"action": "voice", "accent": intent.accent, "gender": intent.gender, "name": intent.name}
