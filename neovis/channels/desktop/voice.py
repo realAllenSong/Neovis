@@ -97,8 +97,26 @@ VOICE_REPLY_NOTES = (
     "containing only '---' and is shown on screen, not spoken. Casual or "
     "conversational questions deserve a direct conversational answer — do NOT "
     "investigate files or run tools unless the request actually needs the "
-    "machine.]"
+    "machine.\n"
+    "NAMES: speech recognition mangles proper nouns (people, apps, tickers, "
+    "file names). If the request hinges on a name you are not confident about, "
+    "say the name back and ASK before doing anything consequential with it — "
+    "'I heard \"Oulasong\" — is that right, or can you spell it?'. The user may "
+    "spell it letter by letter or describe characters; accept either. Once the "
+    "user confirms a spelling, SAVE it to memory immediately (it is then fed "
+    "into speech recognition, so you will hear it correctly from now on) and "
+    "never ask about that name again.]"
 )
+
+
+def _is_smalltalk(text: str) -> bool:
+    """Pure conversation, with no machine work hiding inside it. ('Hey, open
+    Chrome' opens with a greeting but is a task — the keyword buckets catch
+    that, so it is NOT small talk.)"""
+    if not _SMALLTALK_RX.match(text or ""):
+        return False
+    from_bucket = VoiceLoop._ack_bucket(text)
+    return from_bucket not in ("ack_do", "ack_careful")
 
 
 def _first_sentence(text: str, limit: int = 140) -> str:
@@ -113,9 +131,25 @@ def _first_sentence(text: str, limit: int = 140) -> str:
     return t[:limit].strip()
 
 
+# Below this RMS the room is quiet, whatever the VAD thinks.
+_SPEECH_RMS_FLOOR = 0.012
+
 # Lone thinking noises that should never become a turn.
 _FILLERS = frozenset(
     "um uh er ah oh hmm hm mm mhm huh like so well".split())
+
+# Pure conversation openers. These must NOT get a canned "Let me check." ack
+# (nothing is being checked) and must NOT start a speculative main-model turn —
+# both produce the absurd double-reply the user heard: a butler announcing an
+# investigation, then answering "how are you" anyway.
+_SMALLTALK_RX = re.compile(
+    r"^\W*(hey|hi|hello|yo|sup|thanks|thank you|thx|cheers"
+    r"|good (morning|afternoon|evening|job)|well done|nice|cool|great|awesome|perfect"
+    r"|how('?s| is| are| do)?\s*(it going|you|things|you doing|are you)?"
+    r"|what'?s up|who are you|what can you do|are you (there|awake|ready|ok)"
+    r"|you there|still there)\b",
+    re.I,
+)
 
 # Trailing words that mean the speaker isn't done ("…check the folder and").
 _TRAILING_CONNECTIVES = (
@@ -227,6 +261,7 @@ class VoiceLoop:
         self._wav = Path(tempfile.gettempdir()) / "neovis_say.wav"
         self._proc = None             # the asyncio subprocess currently playing
         self._speaking_item = None    # item being synthesized or played
+        self._speaking_flag = False   # plain bool: safe to read from the audio thread
         self._speech_q: asyncio.Queue = asyncio.Queue()
         self._speaker_task: asyncio.Task | None = None
         self._tts_lock = asyncio.Lock()
@@ -292,6 +327,7 @@ class VoiceLoop:
         while True:
             item = await self._speech_q.get()
             self._speaking_item = item   # busy from here, before the wav exists
+            self._speaking_flag = True   # the audio thread reads this, not _proc
             try:
                 wav = item.get("wav")
                 if wav is None:
@@ -319,6 +355,7 @@ class VoiceLoop:
             finally:
                 self._proc = None
                 self._speaking_item = None
+                self._speaking_flag = not self._speech_q.empty()  # more to say?
                 self._speak_end = _time.time()
                 self._speech_q.task_done()
 
@@ -536,13 +573,11 @@ class VoiceLoop:
             # ("hey", "thanks") are usually chat/stop: don't burn a main-model
             # turn on them, just wait for Haiku.
             words = text.split()
-            if len(words) >= 3:
-                # Ack real requests instantly — but "On it." after "thanks so
-                # much" would be absurd, so social openers don't get one.
-                social = words[0].lower().strip(",.!") in (
-                    "thanks", "thank", "ok", "okay", "cool", "nice", "great",
-                    "perfect", "awesome", "good", "hey", "hi", "hello")
-                if len(words) >= 4 and not social:
+            # Small talk gets NEITHER an ack NOR a speculative turn: "How are
+            # you doing?" answered by "Let me check." and then a real reply is
+            # the double-reply that felt broken. Let Haiku just answer it.
+            if len(words) >= 3 and not _is_smalltalk(text):
+                if len(words) >= 4:
                     self.play_cached(self._ack_bucket(text))  # ~50 ms, typed
                     trace.mark("ack")
                 send_task = asyncio.ensure_future(self._run_task(text))
@@ -617,6 +652,37 @@ class VoiceLoop:
         except Exception as exc:
             print("neovis error:", exc)
             self.ui.error(str(exc)[:48])
+        finally:
+            # A turn may have taught us a new name ("save Oulasong to memory")
+            # — fold it into the ASR hotwords NOW, not at the next restart.
+            asyncio.ensure_future(self._maybe_refresh_hotwords())
+
+    def _hotword_phrases(self) -> list[str]:
+        from ...voice.hotwords import names_from_memory
+
+        base = getattr(self, "_base_hotwords", None) or []
+        return list(dict.fromkeys(list(base) + names_from_memory()))
+
+    async def _maybe_refresh_hotwords(self) -> None:
+        """Rebuild the recognizer when memory has learned new names, so a name
+        confirmed once is heard correctly for the REST OF THIS SESSION —
+        confirm → save → recognized, one-time pain."""
+        if getattr(self, "_hotwords_refreshing", False):
+            return
+        phrases = self._hotword_phrases()
+        if set(phrases) == set(self.asr.phrases or []):
+            return
+        self._hotwords_refreshing = True
+        try:
+            from ...voice.asr import build_asr
+
+            new_asr = await asyncio.to_thread(build_asr, hotwords=phrases or None)
+            self.asr = new_asr  # atomic swap; next utterance uses it
+            print(f"(hotwords refreshed — {len(phrases)} names biased)")
+        except Exception as exc:
+            print("(hotword refresh failed:", exc, ")")
+        finally:
+            self._hotwords_refreshing = False
 
     async def _while_busy(self, text: str) -> None:
         """A voice arrived while a task is running — the conversation must not
@@ -811,12 +877,19 @@ class VoiceLoop:
     async def run_hands_free(self, samplerate: int = 16000, barge_in: bool = False) -> None:
         """Continuous VAD-segmented listening: no key to hold.
 
+        The ENTIRE audio path — mic, VAD, ASR — runs on its own thread and
+        hands the event loop nothing but finished transcripts. This is why an
+        utterance is recognized the instant you stop talking: previously VAD ran
+        on the event loop, where a 0.4 s TTS synthesis or a streaming agent turn
+        starved it and the mic backlog was chewed through late.
+
         barge_in=False (default): the mic is IGNORED while Neovis speaks — on
         open speakers its own voice would otherwise trip the VAD, kill playback
         instantly, and get transcribed as ghost input (no echo cancellation).
         barge_in=True (headphones): talk over Neovis to cut it off.
         """
         import queue
+        import threading
         import time as _time
 
         import numpy as np
@@ -824,81 +897,94 @@ class VoiceLoop:
 
         from ...voice.vad import VAD
 
-        # threshold 0.3: catch soft first syllables (0.5 swallowed the user's
-        # first word). min_silence 0.5: long enough that a brief mid-sentence
-        # pause doesn't chop the utterance, short enough that finishing a
-        # sentence doesn't feel like waiting (0.7 read as "several seconds"
-        # once the continuation window stacked on top).
-        vad = VAD(sample_rate=samplerate, threshold=0.3, min_silence=0.5)
-        q: "queue.Queue" = queue.Queue()
+        aloop = asyncio.get_running_loop()
+        raw_q: "queue.Queue" = queue.Queue()          # mic → audio thread
+        utter_q: asyncio.Queue = asyncio.Queue()      # audio thread → event loop
+        stop_flag = threading.Event()
 
         def audio_cb(indata, _n, _t, _s):
-            q.put(indata.copy())
+            raw_q.put(indata.copy())
 
-        stream = sd.InputStream(
-            samplerate=samplerate, channels=1, dtype="float32", blocksize=512, callback=audio_cb
-        )
-        stream.start()
-        mode = "barge-in on (headphones)" if barge_in else "mic muted while Neovis speaks"
-        print(f"Hands-free: just talk — {mode}. Ctrl-C to quit.")
-        was_speaking = False
-        quiet_until = 0.0
-        in_speech = False
+        def post(text: str) -> None:
+            aloop.call_soon_threadsafe(utter_q.put_nowait, text)
 
-        def purge():
-            """Drop everything the mic collected that isn't fresh user speech:
-            the VAD state, and any queued audio backlog (e.g. the 10 s of chunks
-            that piled up while a turn was being handled)."""
-            vad.reset()
-            while True:
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
+        def audio_worker() -> None:
+            """Owns the microphone end to end. Never touches the event loop
+            except to post a finished transcript."""
+            # silero @ 0.3 / 0.5 s — measured: every segment closes 0.41-0.45 s
+            # after the speaker stops, with the first word intact. (TEN VAD at
+            # this threshold left segments open: 1-in-3 closed, 2.4 s late.
+            # See voice/vad.py.)
+            vad = VAD(engine="silero", sample_rate=samplerate,
+                      threshold=0.3, min_silence=0.5)
+            t_start = _time.time()
+            was_speaking = False
+            quiet_until = 0.0
+            in_speech = False
+            pend, pend_at = "", 0.0
 
-        pend = ""        # incomplete utterance held open for a continuation
-        pend_at = 0.0
-        try:
-            while True:
-                if pend and _time.time() > pend_at:  # continuation never came
-                    self.submit(pend)
+            def purge() -> None:
+                vad.reset()
+                while True:
+                    try:
+                        raw_q.get_nowait()
+                    except queue.Empty:
+                        break
+
+            while not stop_flag.is_set():
+                if pend and _time.time() > pend_at:   # continuation never came
+                    post(pend)
                     pend = ""
                 try:
-                    chunk = await asyncio.to_thread(q.get, True, 0.2)
+                    chunk = raw_q.get(timeout=0.15)
                 except queue.Empty:
                     continue
                 frames = chunk.flatten()
 
-                if self.speaking:
+                # The stream's first moments carry a startup transient that the
+                # VAD reads as speech — that's the phantom "Listening…" the user
+                # saw the moment the app opened.
+                if _time.time() - t_start < 0.7:
+                    continue
+
+                if self._speaking_flag:
                     was_speaking = True
                     if not barge_in:
-                        continue  # mic is muted while Neovis talks (speaker echo)
+                        continue  # mic muted while Neovis talks (speaker echo)
                 elif was_speaking:
                     was_speaking = False
-                    purge()  # discard anything captured around playback
+                    purge()                            # drop playback spill
                     quiet_until = _time.time() + 0.35  # echo tail
                     continue
                 elif _time.time() < quiet_until:
                     continue
 
-                vad.accept(frames)
                 rms = float(np.sqrt((frames ** 2).mean()))
+                vad.accept(frames)
                 self.ui.level(rms)
+
                 # Barge-in needs BOTH voice activity and real loudness: a close
-                # mic'd human is far louder than speaker leak, so this keeps
-                # speaker users from having replies cut by their own echo.
-                if barge_in and self.speaking and vad.is_speaking() and rms > 0.04:
-                    self.stop_speaking()  # talk over Neovis to cut it off
-                    purge()               # …but don't transcribe the trigger
+                # mic'd human is far louder than speaker leak.
+                if barge_in and self._speaking_flag and vad.is_speaking() and rms > 0.04:
+                    aloop.call_soon_threadsafe(self.stop_speaking)  # human wins
+                    purge()
                     quiet_until = _time.time() + 0.35
                     continue
-                if vad.is_speaking() and not in_speech:
-                    in_speech = True
-                    self.ui.listening()
+
+                # An RMS floor on the indicator too: room tone can trip a 0.3
+                # VAD threshold, and a capsule that says "Listening…" at silence
+                # is a lie.
+                if vad.is_speaking() and rms > _SPEECH_RMS_FLOOR:
+                    if not in_speech:
+                        in_speech = True
+                        self.ui.listening()
+                elif not vad.is_speaking():
+                    in_speech = False
+
                 for seg in vad.segments():
                     in_speech = False
                     _t0 = _time.time()
-                    text = self.asr.transcribe_samples(seg, samplerate)
+                    text = self.asr.transcribe_samples(seg, samplerate)  # this thread
                     self.last_asr_s = _time.time() - _t0
                     if not text.strip():
                         continue
@@ -908,19 +994,35 @@ class VoiceLoop:
                     bare = text.lower().strip(" .,!?…")
                     if not pend and bare in _FILLERS:
                         continue  # a lone "um"/"oh" is thinking noise, not input
-                    if pend:  # continuation of a held-open thought
+                    if pend:      # continuation of a held-open thought
                         text = f"{pend} {text}"
                         pend = ""
                     if not _utterance_complete(text):
                         pend, pend_at = text, _time.time() + 0.7
                         continue
-                    # non-blocking: the mic stays live while the turn runs, so
-                    # you can keep talking (status, steer, stop) mid-task.
-                    self.submit(text)
+                    post(text)
+                    purge()       # the turn may take seconds — drop stale audio
+                    quiet_until = _time.time() + 0.3
+
+        stream = sd.InputStream(
+            samplerate=samplerate, channels=1, dtype="float32", blocksize=512, callback=audio_cb
+        )
+        stream.start()
+        worker = threading.Thread(target=audio_worker, name="neovis-audio", daemon=True)
+        worker.start()
+        mode = "barge-in on (headphones)" if barge_in else "mic muted while Neovis speaks"
+        print(f"Hands-free: just talk — {mode}. Ctrl-C to quit.")
+        try:
+            while True:
+                # The event loop does nothing but dispatch finished utterances.
+                text = await utter_q.get()
+                self.submit(text)
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            stop_flag.set()
             stream.stop()
+            worker.join(timeout=1.0)
 
 
 async def build_voice_loop(*, voice="sky", hotwords=None, audit_db="neovis_audit.db",
@@ -966,6 +1068,7 @@ async def build_voice_loop(*, voice="sky", hotwords=None, audit_db="neovis_audit
     router = IntentRouter()
     await router.connect()
     loop = VoiceLoop(session, asr, tts, router=router, ui=ui)
+    loop._base_hotwords = list(hotwords or [])  # user-configured, always kept
     loop._speaker_task = asyncio.create_task(loop._speaker_loop())  # the one voice
     loop.build_ack_bank()  # instant acknowledgment clips, ready before turn 1
 

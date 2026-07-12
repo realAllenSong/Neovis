@@ -240,6 +240,33 @@ def _format_step(name: str, tool_input: dict) -> str:
     return short
 
 
+# ── the thinking animation ────────────────────────────────────────────────────
+# Slack has no spinners, so we animate by editing the message: a braille spinner
+# plus a light travelling through a bar. It runs from the moment the message
+# lands until the answer replaces it, so a long task never looks frozen.
+_SPINNER = "⣾⣽⣻⢿⡿⣟⣯⣷"
+_BAR_W = 12
+
+
+def _shimmer(frame: int, width: int = _BAR_W) -> str:
+    head = frame % width
+    cells = []
+    for i in range(width):
+        d = min(abs(i - head), width - abs(i - head))  # wrap-around distance
+        cells.append("█" if d == 0 else "▓" if d == 1 else "▒" if d == 2 else "░")
+    return "".join(cells)
+
+
+def thinking_frame(frame: int, steps: list[str] | None = None) -> str:
+    """One frame of the 'Neovis is thinking' animation, with the live step
+    trace underneath once tools start running."""
+    head = f"{_SPINNER[frame % len(_SPINNER)]}  *Neovis is thinking*  `{_shimmer(frame)}`"
+    if steps:
+        trace = "\n".join(f"• {s}" for s in steps[-8:])
+        return f"{head}\n{trace}"
+    return head
+
+
 def build_slack_app():
     """Construct the AsyncApp with all handlers wired. Requires the 'slack' extra."""
     from slack_bolt.async_app import AsyncApp
@@ -308,7 +335,7 @@ def build_slack_app():
                 pass
             text = _STEER_NOTE + text
 
-        status = await client.chat_postMessage(channel=channel, text="🤔  _Neovis is on it…_")
+        status = await client.chat_postMessage(channel=channel, text=thinking_frame(0))
         status_ts = status["ts"]
 
         steps: list[str] = []
@@ -317,19 +344,20 @@ def build_slack_app():
             steps.append(_format_step(name, tool_input))
 
         async def show_progress():
-            shown = -1
+            """Animate 'Neovis is thinking' continuously — the shimmer proves
+            it's alive even when a step takes 30 s. (1 s cadence respects
+            Slack's ~1 edit/sec rate limit.)"""
+            frame = 0
             while True:
                 await asyncio.sleep(1.0)
-                if len(steps) != shown:
-                    shown = len(steps)
-                    trace = "\n".join(f"• {s}" for s in steps[-10:])
-                    try:
-                        await client.chat_update(
-                            channel=channel, ts=status_ts,
-                            text=(f"🔧  _working…_\n{trace}" if trace else "🤔  _Neovis is on it…_"),
-                        )
-                    except Exception:
-                        pass
+                frame += 1
+                try:
+                    await client.chat_update(
+                        channel=channel, ts=status_ts,
+                        text=thinking_frame(frame, steps),
+                    )
+                except Exception:
+                    pass
 
         session = await _get_session(config, audit, user, channel, client)
 

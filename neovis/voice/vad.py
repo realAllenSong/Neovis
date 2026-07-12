@@ -16,8 +16,18 @@ SILERO_VAD_MODEL = MODELS_DIR / "silero_vad.onnx"
 
 
 class VAD:
-    """Voice activity detector. Defaults to TEN VAD (newer, more accurate than
-    silero on noisy/short speech); falls back to silero if TEN isn't present."""
+    """Voice activity detector.
+
+    Defaults to **silero**, not TEN, on measured evidence: under sherpa-onnx,
+    TEN VAD detects speech fine (``is_speech_detected`` works) but is far too
+    eager to keep a segment OPEN — at threshold 0.3 it flagged 85% of a clip
+    that was 45% silence, so segments only closed 1 time in 3, and when they
+    did it took 2.4 s after the speaker stopped. Raising TEN's threshold to
+    close them reliably starts swallowing first words. Silero at 0.3 closed
+    every segment 0.41–0.45 s after speech ended with the first word intact.
+    TEN remains available explicitly (``engine="ten"``) for noisy rooms, where
+    its detection quality is the reason we adopted it.
+    """
 
     def __init__(
         self,
@@ -32,7 +42,7 @@ class VAD:
         import sherpa_onnx
 
         if engine is None:
-            engine = "ten" if TEN_VAD_MODEL.exists() else "silero"
+            engine = "silero" if SILERO_VAD_MODEL.exists() else "ten"
         self.engine = engine
 
         cfg = sherpa_onnx.VadModelConfig()
