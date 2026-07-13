@@ -268,6 +268,8 @@ class VoiceLoop:
         self._last_spoken = ""        # for echo detection (hearing ourselves)
         self._speak_end = 0.0         # when playback last stopped
         self._narrated = ""           # last interim line narrated aloud
+        self._speculating = False     # a turn is running before the router ruled
+        self._held_narration = ""     # its narration, withheld until confirmed
         self._trace: _Trace | None = None
         self.last_asr_s: float | None = None
         self._bank: dict[str, list] = {}   # pre-synthesized instant clips
@@ -335,6 +337,10 @@ class VoiceLoop:
                     # background bank fill (sherpa TTS is not re-entrant).
                     async with self._tts_lock:
                         wav = await asyncio.to_thread(self._synth, item["text"])
+                # Every single thing Neovis says is logged, with its kind — the
+                # terminal must show the WHOLE conversation, not just the final
+                # answer, or a stray clip is impossible to trace.
+                print(f"🔊 [{item.get('kind', 'say')}] {item.get('text', '')}")
                 if item.get("on_start"):
                     try:
                         item["on_start"]()       # text appears AS audio starts
@@ -577,14 +583,27 @@ class VoiceLoop:
             # you doing?" answered by "Let me check." and then a real reply is
             # the double-reply that felt broken. Let Haiku just answer it.
             if len(words) >= 3 and not _is_smalltalk(text):
-                if len(words) >= 4:
-                    self.play_cached(self._ack_bucket(text))  # ~50 ms, typed
+                # GPT-Live's rule: a filler is for covering DELEGATED WORK, not
+                # for every sentence. Only speak one when the request clearly
+                # asks the machine to do or look something up; a musing like
+                # "I guess you should take a rest" gets no butler announcement.
+                bucket = self._ack_bucket(text)
+                if bucket != "ack":
+                    self.play_cached(bucket)   # ~50 ms, typed to the request
                     trace.mark("ack")
+                # The turn runs, but SILENTLY, until the router rules on it.
+                self._speculating = True
+                self._held_narration = ""
                 send_task = asyncio.ensure_future(self._run_task(text))
             intent = await self.router.classify(text)
             trace.mark("router")
         action = intent.get("action", "task")
         trace.d["action"] = action
+        if send_task is not None:
+            if action == "task":
+                self._release_speculation()   # it was real — let it speak
+            else:
+                self._discard_speculation()   # it was not — drop it unheard
 
         async def unwind():
             """Abandon a mis-speculated turn AFTER the user already got their
@@ -648,7 +667,8 @@ class VoiceLoop:
 
     async def _dispatch(self, text: str, intent: dict | None = None) -> None:
         try:
-            print("neovis>", await self.handle_utterance(text, intent=intent))
+            reply = await self.handle_utterance(text, intent=intent)
+            print(f"neovis> {reply}")   # the full reply, including screen-only detail
         except Exception as exc:
             print("neovis error:", exc)
             self.ui.error(str(exc)[:48])
@@ -728,13 +748,23 @@ class VoiceLoop:
     def _narrate(self, block_text: str) -> None:
         """Speak the model's interim commentary as it streams ('Checking the
         repository now.') so working time is narrated, not silent. Queued like
-        everything else — it waits for the ack to finish, never talks over it."""
+        everything else — it waits for the ack to finish, never talks over it.
+
+        While the turn is still SPECULATIVE (the router hasn't ruled yet) the
+        line is withheld: if Haiku comes back with 'chat', this turn is
+        abandoned and its words were never meant to be heard. Speaking them
+        early is what made Neovis answer the same sentence twice.
+        """
         line = _first_sentence(block_text)
         if not line:
             return
         self._narrated = line
         if self._trace is not None and "first_voice_s" not in self._trace.d:
             self._trace.mark("first_voice")
+        if self._speculating:
+            self._held_narration = line
+            self.ui.step(line[:64])   # visible, but silent, until confirmed
+            return
         # Freshness without interruption: a line that hasn't STARTED yet is
         # superseded by this newer one (no point saying "checking…" once the
         # result is known). A line already being spoken always finishes.
@@ -742,6 +772,21 @@ class VoiceLoop:
         self.drop_pending("narrate")
         self.enqueue(text=line, on_start=lambda: self.ui.step(line[:64]),
                      kind="narrate")
+
+    def _release_speculation(self) -> None:
+        """The router confirmed a task: let the withheld narration speak."""
+        self._speculating = False
+        held, self._held_narration = self._held_narration, ""
+        if held:
+            self.enqueue(text=held, on_start=lambda: self.ui.step(held[:64]),
+                         kind="narrate")
+
+    def _discard_speculation(self) -> None:
+        """The router said this was NOT a task: the turn's words are dropped
+        unheard (the turn itself is unwound by the caller)."""
+        self._speculating = False
+        self._held_narration = ""
+        self._narrated = ""
 
     async def _run_task(self, text: str) -> str:
         # GPT-Live-style keep-alive: if the engine goes quiet for ~9 s with no

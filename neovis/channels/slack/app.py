@@ -240,10 +240,43 @@ def _format_step(name: str, tool_input: dict) -> str:
     return short
 
 
-# ── the thinking animation ────────────────────────────────────────────────────
-# Slack has no spinners, so we animate by editing the message: a braille spinner
-# plus a light travelling through a bar. It runs from the moment the message
-# lands until the answer replaces it, so a long task never looks frozen.
+# ── the thinking indicator ────────────────────────────────────────────────────
+# Slack's NATIVE one (assistant.threads.setStatus) renders "Neovis is thinking…"
+# as a proper shimmering status OUTSIDE the message, and clears itself the
+# moment we reply — that's the real product experience, not a fake status
+# message we later overwrite. It needs the app to be an AI app (agent) with the
+# assistant:write scope; where that isn't granted we fall back to animating a
+# placeholder message ourselves.
+_LOADING_MESSAGES = [
+    "is thinking…",
+    "is reading the screen…",
+    "is working on your machine…",
+    "is checking things over…",
+]
+
+
+async def set_thinking(client, channel: str, thread_ts: str, status: str) -> bool:
+    """Native status. Returns False if this workspace/app can't do it."""
+    try:
+        await client.assistant_threads_setStatus(
+            channel_id=channel, thread_ts=thread_ts,
+            status=status, loading_messages=_LOADING_MESSAGES,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def clear_thinking(client, channel: str, thread_ts: str) -> None:
+    try:
+        await client.assistant_threads_setStatus(
+            channel_id=channel, thread_ts=thread_ts, status="")
+    except Exception:
+        pass
+
+
+# Fallback animation (only when the native status isn't available): a braille
+# spinner plus a light travelling through a bar, edited into a placeholder.
 _SPINNER = "⣾⣽⣻⢿⡿⣟⣯⣷"
 _BAR_W = 12
 
@@ -335,31 +368,52 @@ def build_slack_app():
                 pass
             text = _STEER_NOTE + text
 
-        status = await client.chat_postMessage(channel=channel, text=thinking_frame(0))
-        status_ts = status["ts"]
-
+        thread_ts = event.get("thread_ts") or msg_ts
         steps: list[str] = []
 
         def on_tool(name, tool_input):
             steps.append(_format_step(name, tool_input))
 
+        # Prefer Slack's native status; only fake it if the app lacks the scope.
+        native = await set_thinking(client, channel, thread_ts, "is thinking…")
+        status_ts = None
+        if not native:
+            posted = await client.chat_postMessage(channel=channel, text=thinking_frame(0))
+            status_ts = posted["ts"]
+
         async def show_progress():
-            """Animate 'Neovis is thinking' continuously — the shimmer proves
-            it's alive even when a step takes 30 s. (1 s cadence respects
-            Slack's ~1 edit/sec rate limit.)"""
+            """Keep the indicator alive and honest. Native: refresh the status
+            with the current step (Slack drops it after 2 min of silence).
+            Fallback: animate the placeholder message."""
             frame = 0
+            last = -1
             while True:
                 await asyncio.sleep(1.0)
                 frame += 1
+                if native:
+                    if len(steps) != last or frame % 30 == 0:  # step change, or keep-alive
+                        last = len(steps)
+                        detail = steps[-1] if steps else ""
+                        await set_thinking(
+                            client, channel, thread_ts,
+                            f"is working — {detail}"[:100] if detail else "is thinking…")
+                    continue
                 try:
                     await client.chat_update(
-                        channel=channel, ts=status_ts,
-                        text=thinking_frame(frame, steps),
-                    )
+                        channel=channel, ts=status_ts, text=thinking_frame(frame, steps))
                 except Exception:
                     pass
 
         session = await _get_session(config, audit, user, channel, client)
+
+        async def reply(body: str) -> None:
+            """Post the answer — replacing the placeholder, or as a fresh
+            message in the thread (which clears the native status)."""
+            if status_ts:
+                await client.chat_update(channel=channel, ts=status_ts, text=body)
+            else:
+                await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=body)
+                await clear_thinking(client, channel, thread_ts)
 
         async def work() -> None:
             updater = asyncio.create_task(show_progress())
@@ -367,13 +421,11 @@ def build_slack_app():
                 output = await session.send(text, on_tool=on_tool)
             except Exception as exc:  # keep the channel alive on any tool/model error
                 updater.cancel()
-                await client.chat_update(channel=channel, ts=status_ts, text=f"⚠️ Error: {exc}")
+                await reply(f"⚠️ Error: {exc}")
                 return
             updater.cancel()
 
-            # Replace the working message with the final answer, rendered for Slack.
-            await client.chat_update(channel=channel, ts=status_ts,
-                                     text=to_mrkdwn(output) or "_(done)_")
+            await reply(to_mrkdwn(output) or "_(done)_")
             try:
                 await client.reactions_remove(channel=channel, timestamp=msg_ts, name="eyes")
                 await client.reactions_add(channel=channel, timestamp=msg_ts, name="white_check_mark")
